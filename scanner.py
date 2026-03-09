@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
+
+# -*- coding: utf-8 -*-
+
 “””
-Nasdaq 100 — Daily Trading Signal Scanner
-Gera sugestões de day trading e swing trading (até 1 semana).
-Dados: Yahoo Finance (gratuito, sem API key necessária)
+Nasdaq 100 - Daily Trading Signal Scanner
+Gera sugestoes de day trading e swing trading (ate 1 semana).
+Dados: Yahoo Finance (gratuito, sem API key necessaria)
 
 Uso local:
 pip install yfinance pandas numpy colorama tabulate requests
 python scanner.py
 python scanner.py –mode swing
 python scanner.py –top 10
-
-Telegram:
-Definir variáveis de ambiente TELEGRAM_TOKEN e TELEGRAM_CHAT_ID
-(feito automaticamente pelo GitHub Actions)
 “””
 
 import os
@@ -30,11 +29,11 @@ from tabulate import tabulate
 
 init(autoreset=True)
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
-# NASDAQ 100 — tickers
+# NASDAQ 100 tickers
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
 NASDAQ100 = [
 “AAPL”,“MSFT”,“NVDA”,“AMZN”,“META”,“GOOGL”,“GOOG”,“TSLA”,“AVGO”,“COST”,
@@ -49,31 +48,31 @@ NASDAQ100 = [
 “SIRI”,“MTCH”,“SWKS”,“OKTA”,“ZM”,“DOCU”,“PTON”,“COIN”,“HOOD”,“RBLX”
 ]
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
-# PARÂMETROS DE RISCO
+# PARAMETROS DE RISCO
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
-STOP_ATR_MULT = 1.5    # Stop loss = entrada ± (ATR × mult)
-TARGET_RR     = 2.0    # Risk/Reward mínimo para mostrar sinal
-MIN_SCORE     = 3      # Score mínimo (em 5) para incluir sinal
-MIN_AVG_VOL   = 1_000_000  # Volume médio diário mínimo (liquidez)
+STOP_ATR_MULT = 1.5
+TARGET_RR     = 2.0
+MIN_SCORE     = 3
+MIN_AVG_VOL   = 1_000_000
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
-# INDICADORES TÉCNICOS
+# INDICADORES TECNICOS
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+def compute_rsi(series, period=14):
 delta = series.diff()
 gain  = delta.clip(lower=0).rolling(period).mean()
 loss  = (-delta.clip(upper=0)).rolling(period).mean()
 rs    = gain / loss.replace(0, np.nan)
 return 100 - (100 / (1 + rs))
 
-def compute_atr(high, low, close, period: int = 14) -> pd.Series:
+def compute_atr(high, low, close, period=14):
 tr = pd.concat([
 high - low,
 (high - close.shift()).abs(),
@@ -81,19 +80,19 @@ high - low,
 ], axis=1).max(axis=1)
 return tr.rolling(period).mean()
 
-def compute_macd(series: pd.Series):
+def compute_macd(series):
 ema12  = series.ewm(span=12, adjust=False).mean()
 ema26  = series.ewm(span=26, adjust=False).mean()
 macd   = ema12 - ema26
 signal = macd.ewm(span=9, adjust=False).mean()
 return macd, signal
 
-def compute_bb(series: pd.Series, period: int = 20, std: float = 2.0):
+def compute_bb(series, period=20, std=2.0):
 mid   = series.rolling(period).mean()
 sigma = series.rolling(period).std()
 return mid + std * sigma, mid, mid - std * sigma
 
-def compute_adx(high, low, close, period: int = 14):
+def compute_adx(high, low, close, period=14):
 up   = high.diff()
 down = -low.diff()
 plus_dm  = np.where((up > down) & (up > 0), up, 0.0)
@@ -104,13 +103,13 @@ minus_di = 100 * pd.Series(minus_dm, index=close.index).rolling(period).mean() /
 dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
 return dx.rolling(period).mean(), plus_di, minus_di
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
-# ANÁLISE POR TICKER
+# ANALISE POR TICKER
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
-def analyse_ticker(ticker: str, mode: str = “all”) -> dict | None:
+def analyse_ticker(ticker, mode=“all”):
 try:
 df = yf.download(ticker, period=“6mo”, interval=“1d”,
 auto_adjust=True, progress=False)
@@ -155,28 +154,38 @@ return None
     # Scoring LONG
     score_long, reasons_long = 0, []
     if 40 < r < 65:
-        score_long += 1; reasons_long.append(f"RSI {r:.0f} (zona bullish)")
+        score_long += 1
+        reasons_long.append("RSI %.0f (zona bullish)" % r)
     if m > ms:
-        score_long += 1; reasons_long.append("MACD acima do sinal")
+        score_long += 1
+        reasons_long.append("MACD acima do sinal")
     if c > e20 > e50:
-        score_long += 1; reasons_long.append("Preço > EMA20 > EMA50")
+        score_long += 1
+        reasons_long.append("Preco > EMA20 > EMA50")
     if adxv > 20 and pdi > mdi:
-        score_long += 1; reasons_long.append(f"ADX {adxv:.0f} — tendência bullish")
+        score_long += 1
+        reasons_long.append("ADX %.0f tendencia bullish" % adxv)
     if vol_ratio > 1.3:
-        score_long += 1; reasons_long.append(f"Volume {vol_ratio:.1f}x acima da média")
+        score_long += 1
+        reasons_long.append("Volume %.1fx acima da media" % vol_ratio)
 
     # Scoring SHORT
     score_short, reasons_short = 0, []
     if 35 < r < 60:
-        score_short += 1; reasons_short.append(f"RSI {r:.0f} (zona bearish)")
+        score_short += 1
+        reasons_short.append("RSI %.0f (zona bearish)" % r)
     if m < ms:
-        score_short += 1; reasons_short.append("MACD abaixo do sinal")
+        score_short += 1
+        reasons_short.append("MACD abaixo do sinal")
     if c < e20 < e50:
-        score_short += 1; reasons_short.append("Preço < EMA20 < EMA50")
+        score_short += 1
+        reasons_short.append("Preco < EMA20 < EMA50")
     if adxv > 20 and mdi > pdi:
-        score_short += 1; reasons_short.append(f"ADX {adxv:.0f} — tendência bearish")
+        score_short += 1
+        reasons_short.append("ADX %.0f tendencia bearish" % adxv)
     if vol_ratio > 1.3:
-        score_short += 1; reasons_short.append(f"Volume {vol_ratio:.1f}x acima da média")
+        score_short += 1
+        reasons_short.append("Volume %.1fx acima da media" % vol_ratio)
 
     is_day_long  = (r < 38) and (vol_ratio > 1.5) and (c < bbl * 1.01)
     is_day_short = (r > 62) and (vol_ratio > 1.5) and (c > bbu * 0.99)
@@ -210,13 +219,13 @@ return None
     return {
         "ticker":    ticker,
         "tipo":      trade_type,
-        "direcção":  direction,
-        "preço":     round(c, 2),
+        "dir":       direction,
+        "preco":     round(c, 2),
         "entrada":   round(entry, 2),
         "stop":      stop,
         "target":    round(target, 2),
-        "R/R":       rr,
-        "score":     f"{score}/5",
+        "rr":        rr,
+        "score":     "%d/5" % score,
         "vol_rel":   round(vol_ratio, 2),
         "rsi":       round(r, 1),
         "reasons":   reasons,
@@ -227,87 +236,87 @@ except Exception:
     return None
 ```
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
 # TELEGRAM
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
-def send_telegram(message: str) -> None:
-“”“Envia mensagem para o Telegram via bot.”””
+def send_telegram(message):
 token   = os.environ.get(“TELEGRAM_TOKEN”)
 chat_id = os.environ.get(“TELEGRAM_CHAT_ID”)
 if not token or not chat_id:
 return
-url = f”https://api.telegram.org/bot{token}/sendMessage”
-# Telegram tem limite de 4096 chars por mensagem — dividir se necessário
+url    = “https://api.telegram.org/bot%s/sendMessage” % token
 chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
 for chunk in chunks:
 try:
-requests.post(url, data={“chat_id”: chat_id, “text”: chunk, “parse_mode”: “Markdown”}, timeout=10)
+requests.post(url, data={“chat_id”: chat_id, “text”: chunk,
+“parse_mode”: “Markdown”}, timeout=10)
 except Exception as e:
-print(f”  ⚠️  Erro ao enviar Telegram: {e}”)
+print(“Erro Telegram: %s” % e)
 
-def format_for_telegram(signals: list) -> str:
-“”“Formata os sinais para mensagem Markdown no Telegram.”””
+def format_for_telegram(signals):
 date_str = datetime.now().strftime(”%d/%m/%Y”)
 lines = [
-f”*📊 NASDAQ 100 — SINAIS DO DIA*”,
-f”*{date_str}*”,
+“*NASDAQ 100 - SINAIS DO DIA*”,
+“*%s*” % date_str,
 “”
 ]
 for s in signals:
-emoji_dir  = “🟢” if s[“direcção”] == “LONG” else “🔴”
-emoji_type = “⚡” if s[“tipo”] == “DAY” else “📅”
-lines.append(f”{emoji_dir} *{s[‘ticker’]}*  {emoji_type} {s[‘tipo’]}  |  Score: {s[‘score’]}”)
-lines.append(f”  Entrada: `${s['entrada']}`  |  Stop: `${s['stop']}`  |  Target: `${s['target']}`”)
-lines.append(f”  R/R: `{s['R/R']}x`  |  RSI: `{s['rsi']}`  |  Vol: `{s['vol_rel']}x`”)
+emoji = “BUY” if s[“dir”] == “LONG” else “SELL”
+tipo  = “DAY” if s[“tipo”] == “DAY” else “SWING”
+lines.append(”*%s* | %s | %s | Score: %s” % (s[“ticker”], emoji, tipo, s[“score”]))
+lines.append(”  Entrada: `$%s` | Stop: `$%s` | Target: `$%s` | RR: `%sx`” % (
+s[“entrada”], s[“stop”], s[“target”], s[“rr”]))
 lines.append(””)
-lines.append(”*⚠️ Apenas referência. Não é aconselhamento financeiro.*”)
+lines.append(”*Apenas referencia. Nao e aconselhamento financeiro.*”)
 return “\n”.join(lines)
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
 # OUTPUT TERMINAL
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
 def print_header():
-print(”\n” + “═”*70)
-print(f”  📊  NASDAQ 100 — SCANNER DE SINAIS”)
-print(f”  📅  {datetime.now().strftime(’%d/%m/%Y %H:%M’)}”)
-print(f”  ⚠️   APENAS PARA REFERÊNCIA — Não é aconselhamento financeiro”)
-print(“═”*70 + “\n”)
+print(”\n” + “=”*70)
+print(”  NASDAQ 100 - SCANNER DE SINAIS”)
+print(”  %s” % datetime.now().strftime(”%d/%m/%Y %H:%M”))
+print(”  APENAS PARA REFERENCIA - Nao e aconselhamento financeiro”)
+print(”=”*70 + “\n”)
 
 def print_signal(s, idx):
-d_color = Fore.GREEN if s[“direcção”] == “LONG” else Fore.RED
+d_color = Fore.GREEN if s[“dir”] == “LONG” else Fore.RED
 t_color = Fore.YELLOW if s[“tipo”] == “DAY” else Fore.CYAN
-print(f”{‘─’*60}”)
-print(f”  #{idx:<3} {Style.BRIGHT}{s[‘ticker’]:<8}{Style.RESET_ALL}”
-f” | {t_color}{s[‘tipo’]}{Style.RESET_ALL}”
-f” | {d_color}{s[‘direcção’]}{Style.RESET_ALL}”
-f” | Score: {s[‘score’]}”)
-print(f”       Preço actual : ${s[‘preço’]}”)
-print(f”       Entrada      : ${s[‘entrada’]}”)
-print(f”  🟢   Target       : ${s[‘target’]}”)
-print(f”  🔴   Stop Loss    : ${s[‘stop’]}”)
-print(f”       R/R          : {s[‘R/R’]}x  |  RSI: {s[‘rsi’]}  |  Vol: {s[‘vol_rel’]}x”)
-print(f”  📌  {’ | ’.join(s[‘reasons’])}”)
+print(”-”*60)
+print(”  #%-3d %-8s | %s | %s | Score: %s” % (
+idx, s[“ticker”],
+t_color + s[“tipo”] + Style.RESET_ALL,
+d_color + s[“dir”]  + Style.RESET_ALL,
+s[“score”]))
+print(”       Preco actual : $%s” % s[“preco”])
+print(”       Entrada      : $%s” % s[“entrada”])
+print(”  >>   Target       : $%s” % s[“target”])
+print(”  XX   Stop Loss    : $%s” % s[“stop”])
+print(”       R/R: %sx  RSI: %s  Vol: %sx” % (s[“rr”], s[“rsi”], s[“vol_rel”]))
+print(”       “ + “ | “.join(s[“reasons”]))
 
 def print_table(signals):
 rows = [[
-s[“ticker”], s[“tipo”], s[“direcção”],
-f”${s[‘preço’]}”, f”${s[‘entrada’]}”, f”${s[‘stop’]}”,
-f”${s[‘target’]}”, f”{s[‘R/R’]}x”, s[“score”]
+s[“ticker”], s[“tipo”], s[“dir”],
+“$%s” % s[“preco”], “$%s” % s[“entrada”],
+“$%s” % s[“stop”],  “$%s” % s[“target”],
+“%sx” % s[“rr”],    s[“score”]
 ] for s in signals]
-headers = [“Ticker”,“Tipo”,“Dir.”,“Preço”,“Entrada”,“Stop”,“Target”,“R/R”,“Score”]
+headers = [“Ticker”,“Tipo”,“Dir”,“Preco”,“Entrada”,“Stop”,“Target”,“R/R”,“Score”]
 print(tabulate(rows, headers=headers, tablefmt=“rounded_outline”))
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
 # MAIN
 
-# ─────────────────────────────────────────────
+# –––––––––––––––––––––––––
 
 def main():
 parser = argparse.ArgumentParser(description=“Nasdaq 100 Trading Scanner”)
@@ -320,11 +329,11 @@ args = parser.parse_args()
 telegram_mode = bool(os.environ.get("TELEGRAM_TOKEN"))
 
 print_header()
-print(f"  🔍  A analisar {len(NASDAQ100)} tickers... (pode demorar ~60s)\n")
+print("  A analisar %d tickers... (pode demorar ~60s)\n" % len(NASDAQ100))
 
 signals = []
 for i, ticker in enumerate(NASDAQ100, 1):
-    print(f"\r  Progresso: {i}/{len(NASDAQ100)} — {ticker:<8}", end="", flush=True)
+    print("\r  Progresso: %d/%d - %s" % (i, len(NASDAQ100), ticker), end="", flush=True)
     result = analyse_ticker(ticker, mode=args.mode)
     if result:
         signals.append(result)
@@ -332,12 +341,13 @@ for i, ticker in enumerate(NASDAQ100, 1):
 print("\r" + " "*50 + "\r", end="")
 
 if not signals:
-    print(Fore.YELLOW + "  Nenhum sinal encontrado com os critérios actuais.")
+    print("  Nenhum sinal encontrado com os criterios actuais.")
     if telegram_mode:
-        send_telegram(f"📊 *NASDAQ 100 — {datetime.now().strftime('%d/%m/%Y')}*\n\n_Nenhum sinal encontrado hoje._")
+        send_telegram("*NASDAQ 100 - %s*\n\nNenhum sinal encontrado hoje." %
+                      datetime.now().strftime("%d/%m/%Y"))
     return
 
-signals.sort(key=lambda x: (x["score"], x["R/R"]), reverse=True)
+signals.sort(key=lambda x: (x["score"], x["rr"]), reverse=True)
 signals = signals[:args.top]
 
 if args.table:
@@ -346,26 +356,22 @@ else:
     for idx, s in enumerate(signals, 1):
         print_signal(s, idx)
 
-n_long  = sum(1 for s in signals if s["direcção"] == "LONG")
-n_short = sum(1 for s in signals if s["direcção"] == "SHORT")
+n_long  = sum(1 for s in signals if s["dir"] == "LONG")
+n_short = sum(1 for s in signals if s["dir"] == "SHORT")
 n_day   = sum(1 for s in signals if s["tipo"] == "DAY")
 n_swing = sum(1 for s in signals if s["tipo"] == "SWING")
 
-print(f"\n{'═'*60}")
-print(f"  SUMÁRIO: {len(signals)} sinais  |  "
-      f"{Fore.GREEN}LONG: {n_long}{Style.RESET_ALL}  |  "
-      f"{Fore.RED}SHORT: {n_short}{Style.RESET_ALL}  |  "
-      f"{Fore.YELLOW}DAY: {n_day}{Style.RESET_ALL}  |  "
-      f"{Fore.CYAN}SWING: {n_swing}{Style.RESET_ALL}")
-print(f"{'═'*60}\n")
-print("  ⚠️  Estes sinais são baseados em análise técnica e não")
-print("      constituem aconselhamento financeiro.\n")
+print("\n" + "="*60)
+print("  SUMARIO: %d sinais | LONG: %d | SHORT: %d | DAY: %d | SWING: %d" % (
+    len(signals), n_long, n_short, n_day, n_swing))
+print("="*60)
+print("\n  AVISO: Sinais baseados em analise tecnica.")
+print("  Nao constituem aconselhamento financeiro.\n")
 
-# Enviar para Telegram se variáveis configuradas
 if telegram_mode:
     msg = format_for_telegram(signals)
     send_telegram(msg)
-    print("  ✅  Mensagem enviada ao Telegram!\n")
+    print("  Mensagem enviada ao Telegram!\n")
 ```
 
 if **name** == “**main**”:
