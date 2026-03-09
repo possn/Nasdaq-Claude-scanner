@@ -2,7 +2,7 @@ name: Daily Trading Scanner
 
 on:
   schedule:
-    - cron: '30 7 * * 1-5'
+    - cron: '30 12 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -22,7 +22,6 @@ jobs:
 
       - name: Correr scanner e enviar para Telegram
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scanner.py --universe smallcap --top 10
-
+        run: python scanner.py --universe nasdaq100 --top 10
