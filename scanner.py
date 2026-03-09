@@ -479,7 +479,7 @@ def main():
     parser.add_argument("--top",       type=int, default=15)
     parser.add_argument("--table",     action="store_true")
     parser.add_argument("--universe",  choices=["nasdaq100","smallcap","all"],
-                        default="nasdaq100")
+                        default="smallcap")
     args = parser.parse_args()
 
     tickers        = UNIVERSES[args.universe]
