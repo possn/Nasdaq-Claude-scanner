@@ -104,6 +104,7 @@ TARGET_RR        = 2.0
 MIN_SCORE        = 5.0    # score ponderado minimo (escala 0-10)
 MIN_AVG_VOL      = 100_000
 MIN_ATR_PCT      = 0.5    # volatilidade minima: ATR deve ser >= 0.5% do preco
+MIN_PRICE        = 2.0    # preco minimo por accao (elimina penny stocks)
 
 # --------------------------------------------------
 # INDICADORES
@@ -205,6 +206,10 @@ def analyse_ticker(ticker, mode="all"):
         s50   = float(sma50.iloc[-1])
         s200  = float(sma200.iloc[-1]) if len(close) >= 200 else None
         vol_ratio = float(volume.iloc[-1]) / float(avg_vol)
+
+        # Filtro: preco minimo (eliminar penny stocks)
+        if c < MIN_PRICE:
+            return None
 
         # Filtro: volatilidade minima
         atr_pct = (at / c) * 100
@@ -360,10 +365,10 @@ def analyse_ticker(ticker, mode="all"):
             reasons_short.append("[!] Perto de suporte BB")
 
         # ── SELECCAO ─────────────────────────────────────────
-        is_day_long  = (r < 35) and (vol_ratio > 1.5) and (c < bbl * 1.01)
-        is_day_short = (r > 65) and (vol_ratio > 1.5) and (c > bbu * 0.99)
+        is_day_long = (r < 35) and (vol_ratio > 1.5) and (c < bbl * 1.01)
 
-        if score_long >= score_short and score_long >= MIN_SCORE:
+        # Apenas sinais de compra (LONG)
+        if score_long >= MIN_SCORE:
             direction  = "LONG"
             score      = score_long
             reasons    = reasons_long
@@ -372,15 +377,6 @@ def analyse_ticker(ticker, mode="all"):
             stop       = round(entry - at * STOP_ATR_MULT, 2)
             risk       = entry - stop
             target     = round(entry + risk * TARGET_RR, 2)
-        elif score_short > score_long and score_short >= MIN_SCORE:
-            direction  = "SHORT"
-            score      = score_short
-            reasons    = reasons_short
-            trade_type = "DAY" if is_day_short else "SWING"
-            entry      = c
-            stop       = round(entry + at * STOP_ATR_MULT, 2)
-            risk       = stop - entry
-            target     = round(entry - risk * TARGET_RR, 2)
         else:
             return None
 
