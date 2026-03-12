@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Trading Scanner v5 - Small/Micro Cap $2-$30 - Apenas sinais BUY
+# Trading Scanner v6 - Small/Micro Cap dinamico via ETF holdings
+# Universo: Russell 2000 (IWM) + Micro Cap (IWC) - sempre actualizado
+# Preco: $2-$50 | Volume min: 75k | Score min: 5.0 | Apenas BUY
 
 import os
 import argparse
@@ -18,80 +20,85 @@ from tabulate import tabulate
 init(autoreset=True)
 
 # --------------------------------------------------
-# UNIVERSOS
-# --------------------------------------------------
-
-NASDAQ100 = [
-    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","AVGO","COST",
-    "ASML","NFLX","AMD","AZN","QCOM","CSCO","TMUS","INTU","LIN","AMGN",
-    "ISRG","AMAT","TXN","BKNG","VRTX","MU","REGN","ADI","PANW","LRCX",
-    "SBUX","MDLZ","SNPS","KLAC","CDNS","MELI","GILD","CRWD","CTAS","PDD",
-    "CEG","INTC","ABNB","ORLY","MAR","ADSK","FTNT","DXCM","ROP","MNST",
-    "WDAY","ROST","ADP","PCAR","MRVL","CHTR","ODFL","CPRT","MCHP","KDP",
-    "PAYX","FANG","EXC","CTSH","NXPI","EA","FAST","IDXX","VRSK","GEHC",
-    "CSGP","XEL","DDOG","WBD","ZS","SGEN","TEAM","ON","GFS","ANSS",
-    "LULU","DLTR","BIIB","TTWO","ILMN","WBA","LCID","RIVN","ENPH","ALGN",
-    "SIRI","MTCH","SWKS","OKTA","ZM","DOCU","PTON","COIN","HOOD","RBLX"
-]
-
-# Lista curada e validada de small/micro caps activas no NYSE/Nasdaq
-# Criterios: listadas bolsa principal (nao OTC), price $2-$30 historico,
-# volume medio > 50k/dia, empresa operacional (nao shell/SPAC vazio)
-SMALLCAP = [
-    # Tecnologia
-    "IONQ","JOBY","RKLB","AEHR","HEAR","BIGC","DOMO","FSLY","LPSN","MGNI",
-    "MNKD","NKLA","OPEN","SKLZ","STEM","UWMC","XPEV","ZETA","BLNK","CHPT",
-    "EVGO","GEVO","GRAB","LAZR","MVIS","OUST","SPCE","WKHS","BYND","CLOV",
-    "HOOD","COIN","RBLX","PTON","LCID","RIVN","HIMS","DKNG","LIDR","MAPS",
-    "MTTR","NVTS","ACCD","EVBG","EXPI","CPSI","INPX","MARK","MFIN","NRDS",
-    "NTST","PESI","GILT","CODA","COMS","CLFD","CNXC","DTRT","OTRK","PAYO",
-    # Saude / Biotech
-    "AXSM","BEAM","BHVN","BNGO","ARCT","ARDX","AVIR","ALTO","AMRX","APLS",
-    "AGEN","ALLO","ATRS","AVDL","BCYC","BDSX","BOLD","BPMC","ARHS","ALDX",
-    "ALEC","ALVR","ATEX","ATRC","AVAH","ACCD","ACST","ADMA","ADMP","AEZS",
-    "AFMD","AGRX","AHCO","AKBA","AKRO","ALBO","ALCO","ALGT","ALAB","ATIP",
-    "IMVT","KALA","MNKD","ORMP","PHVS","CARE","CABA","ARQT","OPTX","OWLT",
-    # Energia / Materiais
-    "AMPY","CLNE","CDEV","CRGY","BCEI","ARCH","BATL","CRIS","STEM","GEVO",
-    # Consumo / Retalho / Outros
-    "PRPL","SKLZ","UWMC","VIEW","ZVIA","PNTM","LUCY","DFLI","GOEV","ORGN",
-    "OPAD","RIDE","BYND","CSSE","MVST","NKLA","CLOV","SPCE","WKHS","XPEV",
-    # Financas small cap
-    "ATLC","MFIN","CPSI","ACNB","AAME","AFBI","AFCG","AGIO","AGBA","AGFS",
-    # Industriais / Outros activos
-    "JOBY","RKLB","BLNK","CHPT","EVGO","LAZR","OUST","MVIS","IONQ","LIDR",
-    "AEHR","NVTS","STEM","CLNE","GEVO","AMPY","CRGY","CDEV","HEAR","GILT",
-    # Micro caps adicionais com liquidez confirmada
-    "SIRI","RIVN","LCID","HOOD","GRAB","DKNG","HIMS","COIN","RBLX","PTON",
-    "OPEN","UWMC","XPEV","ZETA","MGNI","FSLY","LPSN","DOMO","BIGC","JOBY",
-    "IONQ","RKLB","BLNK","CHPT","EVGO","SPCE","WKHS","BYND","NKLA","CLOV"
-]
-
-# Remover duplicados mantendo ordem
-seen = set()
-SMALLCAP_CLEAN = []
-for t in SMALLCAP:
-    if t not in seen:
-        seen.add(t)
-        SMALLCAP_CLEAN.append(t)
-SMALLCAP = SMALLCAP_CLEAN
-
-UNIVERSES = {
-    "nasdaq100": NASDAQ100,
-    "smallcap":  SMALLCAP,
-    "all":       list(set(NASDAQ100 + SMALLCAP))
-}
-
-# --------------------------------------------------
 # PARAMETROS
 # --------------------------------------------------
 STOP_ATR_MULT = 1.5
 TARGET_RR     = 2.0
 MIN_SCORE     = 5.0
-MIN_AVG_VOL   = 50_000
+MIN_AVG_VOL   = 75_000
 MIN_ATR_PCT   = 0.5
 MIN_PRICE     = 2.0
-MAX_PRICE     = 30.0
+MAX_PRICE     = 50.0
+MAX_TICKERS   = 400   # limite para nao demorar mais de 5min no Actions
+
+# ETFs fonte dos universos
+ETF_SOURCES = {
+    "russell2000": "IWM",    # iShares Russell 2000 - ~2000 small caps
+    "microcap":    "IWC",    # iShares Micro Cap    - ~1400 micro caps
+    "smallcap":    "SCHA",   # Schwab US Small Cap  - ~1700 small caps
+}
+
+# Fallback: lista estatica caso o download dos ETFs falhe
+FALLBACK_TICKERS = [
+    "RIVN","SIRI","LCID","HOOD","GRAB","HIMS","IONQ","JOBY","RKLB","BLNK",
+    "CHPT","EVGO","MVIS","BYND","NKLA","CLOV","SPCE","STEM","CLNE","GEVO",
+    "LAZR","OUST","OPEN","SKLZ","WKHS","XPEV","ZETA","MGNI","FSLY","LPSN",
+    "DOMO","BIGC","AEHR","HEAR","GILT","MNKD","NVTS","MTTR","MVST","MARK",
+    "AXSM","BEAM","BHVN","BNGO","ARCT","AGEN","AVIR","AMRX","ATRS","AVDL",
+    "AMPY","CRGY","CDEV","ARCH","BATL","PRPL","UWMC","ORGN","RIDE","ZVIA",
+    "COIN","RBLX","PTON","DKNG","MAPS","ACCD","EVBG","EXPI","CPSI","PESI",
+    "ATIP","ATLC","MFIN","ACNB","IONQ","RKLB","AEHR","HEAR","GILT","BLNK",
+]
+
+# --------------------------------------------------
+# OBTER TICKERS DOS ETFs DINAMICAMENTE
+# --------------------------------------------------
+
+def get_etf_tickers(etf_symbols, max_tickers=MAX_TICKERS):
+    all_tickers = set()
+    for name, symbol in etf_symbols.items():
+        try:
+            etf = yf.Ticker(symbol)
+            holdings = etf.funds_data.top_holdings if hasattr(etf, 'funds_data') else None
+            if holdings is not None and not holdings.empty:
+                tickers = list(holdings.index)
+                all_tickers.update(tickers)
+                print("  ETF %s (%s): %d holdings obtidos" % (symbol, name, len(tickers)))
+                continue
+        except Exception:
+            pass
+
+        # Metodo alternativo: usar yf.download para obter constituintes
+        try:
+            etf_data = yf.Ticker(symbol)
+            info = etf_data.info
+            # Tentar via fast_info
+            if hasattr(etf_data, 'funds_data'):
+                fd = etf_data.funds_data
+                if hasattr(fd, 'top_holdings') and fd.top_holdings is not None:
+                    tickers = list(fd.top_holdings.index)
+                    all_tickers.update(tickers)
+                    print("  ETF %s (%s): %d holdings obtidos" % (symbol, name, len(tickers)))
+        except Exception as e:
+            print("  ETF %s: falhou (%s)" % (symbol, str(e)[:50]))
+
+    # Se nao conseguiu tickers suficientes, usar fallback
+    if len(all_tickers) < 50:
+        print("  Usando lista fallback (%d tickers)" % len(FALLBACK_TICKERS))
+        return FALLBACK_TICKERS
+
+    # Filtrar tickers validos (sem caracteres especiais, 1-5 letras)
+    clean = [t for t in all_tickers
+             if isinstance(t, str) and t.isalpha() and 1 <= len(t) <= 5]
+
+    # Limitar ao maximo definido (aleatoriamente para variar dia a dia)
+    if len(clean) > max_tickers:
+        import random
+        random.seed(datetime.now().toordinal())  # seed pelo dia - mesmo resultado no mesmo dia
+        clean = random.sample(clean, max_tickers)
+
+    print("  Total universo: %d tickers unicos" % len(clean))
+    return sorted(clean)
 
 # --------------------------------------------------
 # INDICADORES
@@ -137,7 +144,7 @@ def compute_adx(high, low, close, period=14):
     return dx.rolling(period).mean(), plus_di, minus_di
 
 # --------------------------------------------------
-# ANALISE
+# ANALISE POR TICKER
 # --------------------------------------------------
 
 def analyse_ticker(ticker, mode="all"):
@@ -168,8 +175,8 @@ def analyse_ticker(ticker, mode="all"):
         atr                    = compute_atr(high, low, close)
         bb_up, bb_mid, bb_low  = compute_bb(close)
         adx, plus_di, minus_di = compute_adx(high, low, close)
-        ema20  = close.ewm(span=20,  adjust=False).mean()
-        ema50  = close.ewm(span=50,  adjust=False).mean()
+        ema20  = close.ewm(span=20, adjust=False).mean()
+        ema50  = close.ewm(span=50, adjust=False).mean()
         sma50  = close.rolling(50).mean()
         sma200 = close.rolling(200).mean()
 
@@ -194,82 +201,80 @@ def analyse_ticker(ticker, mode="all"):
         if atr_pct < MIN_ATR_PCT:
             return None
 
-        # SMA200 opcional: se nao tiver dados suficientes usa EMA50
-        s50  = float(sma50.iloc[-1])
-        s200_val = sma200.dropna()
-        if len(s200_val) >= 20:
-            s200 = float(s200_val.iloc[-1])
-            golden_cross = s50 > s200
+        s50       = float(sma50.iloc[-1])
+        s200_vals = sma200.dropna()
+        if len(s200_vals) >= 20:
+            golden_cross = s50 > float(s200_vals.iloc[-1])
         else:
             golden_cross = c > e50
 
-        above_ema20  = (close.iloc[-10:] > ema20.iloc[-10:]).sum() / 10.0
+        above_ema20    = (close.iloc[-10:] > ema20.iloc[-10:]).sum() / 10.0
         bullish_candle = c > o
 
-        # Score LONG ponderado
-        score_long = 0.0
+        # Score ponderado LONG
+        score   = 0.0
         reasons = []
 
         if 35 < r < 55:
-            score_long += 1.5
+            score += 1.5
             reasons.append("RSI %.0f zona bullish" % r)
         elif 55 <= r < 65:
-            score_long += 0.5
+            score += 0.5
             reasons.append("RSI %.0f aceitavel" % r)
 
         if r > r_1:
-            score_long += 0.5
+            score += 0.5
             reasons.append("RSI subindo")
 
         if m > ms and mh > mh_1:
-            score_long += 2.0
+            score += 2.0
             reasons.append("MACD bullish + histograma crescente")
         elif m > ms:
-            score_long += 1.0
+            score += 1.0
             reasons.append("MACD acima do sinal")
 
         if c > e20 > e50:
-            score_long += 2.0
+            score += 2.0
             reasons.append("Preco > EMA20 > EMA50")
         elif c > e20:
-            score_long += 1.0
+            score += 1.0
             reasons.append("Preco > EMA20")
 
         if golden_cross:
-            score_long += 1.5
+            score += 1.5
             reasons.append("Tendencia macro bullish")
 
         if adxv > 25 and pdi > mdi:
-            score_long += 1.5
+            score += 1.5
             reasons.append("ADX %.0f forte bullish" % adxv)
         elif adxv > 20 and pdi > mdi:
-            score_long += 0.75
+            score += 0.75
             reasons.append("ADX %.0f moderado bullish" % adxv)
 
         if vol_ratio > 2.0:
-            score_long += 1.0
+            score += 1.0
             reasons.append("Volume %.1fx confirmacao forte" % vol_ratio)
         elif vol_ratio > 1.3:
-            score_long += 0.5
+            score += 0.5
             reasons.append("Volume %.1fx acima media" % vol_ratio)
 
         if bullish_candle:
-            score_long += 0.5
+            score += 0.5
             reasons.append("Candle bullish")
 
         if above_ema20 >= 0.7:
-            score_long += 0.5
+            score += 0.5
             reasons.append("%.0f%% dias acima EMA20" % (above_ema20 * 100))
 
         warnings = []
         if c > bbu * 0.97:
-            score_long -= 1.5
+            score -= 1.5
             warnings.append("Perto resistencia BB")
 
-        if score_long < MIN_SCORE:
+        if score < MIN_SCORE:
             return None
 
-        is_day = (r < 35) and (vol_ratio > 1.5) and (c < bbl * 1.01)
+        is_day     = (r < 35) and (vol_ratio > 1.5) and (c < bbl * 1.01)
         trade_type = "DAY" if is_day else "SWING"
 
         if mode == "day"   and trade_type != "DAY":   return None
@@ -284,13 +289,12 @@ def analyse_ticker(ticker, mode="all"):
         return {
             "ticker":   ticker,
             "tipo":     trade_type,
-            "dir":      "LONG",
             "preco":    round(c, 2),
             "entrada":  round(entry, 2),
             "stop":     stop,
             "target":   round(target, 2),
             "rr":       rr,
-            "score":    round(score_long, 1),
+            "score":    round(score, 1),
             "vol_rel":  round(vol_ratio, 2),
             "rsi":      round(r, 1),
             "atr_pct":  round(atr_pct, 2),
@@ -319,11 +323,11 @@ def send_telegram(message):
         except Exception as e:
             print("Erro Telegram: %s" % e)
 
-def format_for_telegram(signals):
+def format_for_telegram(signals, n_scanned):
     date_str = datetime.now().strftime("%d/%m/%Y")
     lines = [
         "*SMALL/MICRO CAP - SINAIS DO DIA*",
-        "_%s_" % date_str,
+        "_%s | %d acoes analisadas_" % (date_str, n_scanned),
         ""
     ]
     for s in signals:
@@ -343,11 +347,12 @@ def format_for_telegram(signals):
 # OUTPUT TERMINAL
 # --------------------------------------------------
 
-def print_header(universe_name, n_tickers):
+def print_header(n_tickers):
     print("\n" + "="*70)
-    print("  SCANNER v5 - %s (%d tickers) | Preco: $%.0f-$%.0f | Vol min: %dk" % (
-        universe_name.upper(), n_tickers, MIN_PRICE, MAX_PRICE, MIN_AVG_VOL // 1000))
-    print("  %s" % datetime.now().strftime("%d/%m/%Y %H:%M"))
+    print("  SCANNER v6 - Small/Micro Cap | Preco: $%.0f-$%.0f | Vol min: %dk" % (
+        MIN_PRICE, MAX_PRICE, MIN_AVG_VOL // 1000))
+    print("  %s | Fonte: Russell 2000 (IWM) + Micro Cap (IWC)" % (
+        datetime.now().strftime("%d/%m/%Y %H:%M")))
     print("="*70 + "\n")
 
 def print_signal(s, idx):
@@ -368,12 +373,11 @@ def print_signal(s, idx):
 def print_table(signals):
     rows = [[
         s["ticker"], s["tipo"],
-        "$%s" % s["preco"], "$%s" % s["entrada"],
-        "$%s" % s["stop"],  "$%s" % s["target"],
-        "%sx" % s["rr"],    "%.1f" % s["score"],
-        "%s%%" % s["atr_pct"]
+        "$%s" % s["preco"], "$%s" % s["stop"],
+        "$%s" % s["target"], "%sx" % s["rr"],
+        "%.1f" % s["score"], "%s%%" % s["atr_pct"]
     ] for s in signals]
-    headers = ["Ticker","Tipo","Preco","Entrada","Stop","Target","R/R","Score","ATR%"]
+    headers = ["Ticker","Tipo","Preco","Stop","Target","R/R","Score","ATR%"]
     print(tabulate(rows, headers=headers, tablefmt="rounded_outline"))
 
 # --------------------------------------------------
@@ -381,58 +385,62 @@ def print_table(signals):
 # --------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Trading Scanner v5")
-    parser.add_argument("--mode",     choices=["all","day","swing"], default="all")
-    parser.add_argument("--top",      type=int, default=10)
-    parser.add_argument("--table",    action="store_true")
-    parser.add_argument("--universe", choices=["nasdaq100","smallcap","all"],
-                        default="smallcap")
+    parser = argparse.ArgumentParser(description="Trading Scanner v6")
+    parser.add_argument("--mode",  choices=["all","day","swing"], default="all")
+    parser.add_argument("--top",   type=int, default=10)
+    parser.add_argument("--table", action="store_true")
     args = parser.parse_args()
 
-    tickers       = UNIVERSES[args.universe]
     telegram_mode = bool(os.environ.get("TELEGRAM_TOKEN"))
 
-    print_header(args.universe, len(tickers))
-    print("  A analisar %d tickers...\n" % len(tickers))
+    print_header(0)
+    print("  A obter universo de tickers via ETFs...\n")
 
-    signals = []
+    tickers = get_etf_tickers(ETF_SOURCES, MAX_TICKERS)
+
+    print("\n  A analisar %d tickers...\n" % len(tickers))
+
+    signals   = []
+    n_scanned = 0
     for i, ticker in enumerate(tickers, 1):
-        print("\r  Progresso: %d/%d - %-8s" % (i, len(tickers), ticker),
-              end="", flush=True)
+        print("\r  Progresso: %d/%d - %-8s | Sinais: %d" % (
+            i, len(tickers), ticker, len(signals)),
+            end="", flush=True)
         result = analyse_ticker(ticker, mode=args.mode)
+        n_scanned += 1
         if result:
             signals.append(result)
 
-    print("\r" + " "*55 + "\r", end="")
+    print("\r" + " "*65 + "\r", end="")
 
     if not signals:
         print("  Nenhum sinal encontrado hoje.")
         if telegram_mode:
-            send_telegram("*SMALL CAP SCANNER - %s*\n\nNenhum sinal encontrado hoje." %
-                          datetime.now().strftime("%d/%m/%Y"))
+            send_telegram("*SMALL CAP SCANNER - %s*\n\n_%d acoes analisadas._\nNenhum sinal encontrado hoje." % (
+                datetime.now().strftime("%d/%m/%Y"), n_scanned))
         return
 
     signals.sort(key=lambda x: (x["score"], x["rr"]), reverse=True)
-    signals = signals[:args.top]
+    top_signals = signals[:args.top]
 
     if args.table:
-        print_table(signals)
+        print_table(top_signals)
     else:
-        for idx, s in enumerate(signals, 1):
+        for idx, s in enumerate(top_signals, 1):
             print_signal(s, idx)
 
-    n_day   = sum(1 for s in signals if s["tipo"] == "DAY")
-    n_swing = sum(1 for s in signals if s["tipo"] == "SWING")
-    n_warn  = sum(1 for s in signals if s["warnings"])
+    n_day  = sum(1 for s in top_signals if s["tipo"] == "DAY")
+    n_sw   = sum(1 for s in top_signals if s["tipo"] == "SWING")
+    n_warn = sum(1 for s in top_signals if s["warnings"])
 
     print("\n" + "="*65)
-    print("  SUMARIO: %d sinais BUY | DAY: %d | SWING: %d | Avisos: %d" % (
-        len(signals), n_day, n_swing, n_warn))
+    print("  SUMARIO: %d sinais BUY (de %d analisadas) | DAY: %d | SWING: %d | Avisos: %d" % (
+        len(signals), n_scanned, n_day, n_sw, n_warn))
     print("="*65)
     print("  Nao constitui aconselhamento financeiro.\n")
 
     if telegram_mode:
-        msg = format_for_telegram(signals)
+        msg = format_for_telegram(top_signals, n_scanned)
         send_telegram(msg)
         print("  Mensagem enviada ao Telegram!\n")
 
