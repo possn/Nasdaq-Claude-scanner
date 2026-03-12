@@ -27,6 +27,7 @@ TARGET_RR     = 2.0
 MIN_SCORE     = 5.0
 MIN_AVG_VOL   = 75_000
 MIN_ATR_PCT   = 0.5
+MAX_ATR_PCT   = 15.0
 MIN_PRICE     = 2.0
 MAX_PRICE     = 50.0
 MAX_TICKERS   = 400   # limite para nao demorar mais de 5min no Actions
@@ -198,7 +199,7 @@ def analyse_ticker(ticker, mode="all"):
         vol_ratio = float(volume.iloc[-1]) / float(avg_vol)
 
         atr_pct = (at / c) * 100
-        if atr_pct < MIN_ATR_PCT:
+        if atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
             return None
 
         s50       = float(sma50.iloc[-1])
@@ -421,6 +422,16 @@ def main():
         return
 
     signals.sort(key=lambda x: (x["score"], x["rr"]), reverse=True)
+
+    # Remover duplicados (mesmo ticker pode aparecer 2x se estiver em dois ETFs)
+    seen_tickers = set()
+    unique_signals = []
+    for s in signals:
+        if s["ticker"] not in seen_tickers:
+            seen_tickers.add(s["ticker"])
+            unique_signals.append(s)
+    signals = unique_signals
+
     top_signals = signals[:args.top]
 
     if args.table:
