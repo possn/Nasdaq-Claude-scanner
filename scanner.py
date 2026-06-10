@@ -1,10 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Trading Scanner v6 - Small/Micro Cap dinamico via ETF holdings
-# Universo: Russell 2000 (IWM) + Micro Cap (IWC) - sempre actualizado
-# Preco: $2-$50 | Volume min: 75k | Score min: 5.0 | Apenas BUY
+# Trading Scanner v9 - Small/Micro Cap
+#
+# ALTERACOES v9 (correccao de precisao):
+#  1. Universo real: holdings completos via CSV oficial iShares (IWM/IWC),
+#     em vez de funds_data.top_holdings (que so devolve ~10 tickers e
+#     forcava sempre a lista fallback estatica com empresas deslistadas).
+#  2. Verificacao de frescura dos dados: sinais so com barra da ultima
+#     sessao (<=4 dias). Elimina sinais sobre tickers mortos/deslistados.
+#  3. Barra incompleta: se o script correr antes do fecho (21:05 UTC),
+#     a barra do proprio dia e descartada (evita indicadores parciais).
+#  4. RSI / ATR / ADX com suavizacao de Wilder (convencao standard -
+#     valores agora coincidem com os do broker/TradingView).
+#  5. Scoring redesenhado: indicadores colineares deixaram de somar em
+#     duplicado; penalizacoes por sobre-extensao, gap-up, preco abaixo
+#     da SMA200 e volatilidade extrema. Antes, o score saturava
+#     exactamente em acoes esticadas no topo local.
+#  6. Liquidez em dolares (mediana 20d de close*volume >= $2M) em vez de
+#     75k accoes/dia, que em micro caps e intransaccionavel (spread
+#     destruia o R/R teorico).
+#  7. Download em lote (chunks de 100) - menos rate-limiting do Yahoo,
+#     menos falhas silenciosas; falhas agora sao contadas e reportadas.
+#  8. Removida a classificacao "DAY": era inalcancavel (exigia RSI<35
+#     mas o score so premiava momentum bullish) e conceptualmente
+#     contraditoria. O scanner e de swing/momentum.
+#  9. Aviso de earnings proximos (<=7 dias) nos finalistas.
+# 10. Bollinger com ddof=0 (convencao TA).
 
 import os
+import io
+import csv
+import sys
 import argparse
 import warnings
 warnings.filterwarnings("ignore")
@@ -13,7 +39,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from colorama import Fore, Style, init
 from tabulate import tabulate
 
@@ -22,324 +48,438 @@ init(autoreset=True)
 # --------------------------------------------------
 # PARAMETROS
 # --------------------------------------------------
-STOP_ATR_MULT = 1.5
-TARGET_RR     = 2.0
-MIN_SCORE     = 5.0
-MIN_AVG_VOL   = 75_000
-MIN_ATR_PCT   = 0.5
-MAX_ATR_PCT   = 15.0
-MIN_PRICE     = 2.0
-MAX_PRICE     = 50.0
-MAX_TICKERS   = 400   # limite para nao demorar mais de 5min no Actions
+STOP_ATR_MULT   = 1.5
+TARGET_RR       = 2.0
+MIN_SCORE       = 5.0
+MIN_DOLLAR_VOL  = 2_000_000   # mediana 20d de close*volume (USD)
+MIN_ATR_PCT     = 0.5
+MAX_ATR_PCT     = 12.0
+MIN_PRICE       = 2.0
+MAX_PRICE       = 50.0
+MAX_TICKERS     = 400
+MAX_STALE_DAYS  = 4           # barra mais recente nao pode ter mais que isto
+CHUNK_SIZE      = 100         # tickers por chamada yf.download
 
-# ETFs fonte dos universos
-ETF_SOURCES = {
-    "russell2000": "IWM",    # iShares Russell 2000 - ~2000 small caps
-    "microcap":    "IWC",    # iShares Micro Cap    - ~1400 micro caps
-    "smallcap":    "SCHA",   # Schwab US Small Cap  - ~1700 small caps
+# CSV oficiais de holdings da iShares (lista COMPLETA de constituintes)
+ISHARES_CSV = {
+    "IWM": ("https://www.ishares.com/us/products/239710/"
+            "ishares-russell-2000-etf/1467271812596.ajax"
+            "?fileType=csv&fileName=IWM_holdings&dataType=fund"),
+    "IWC": ("https://www.ishares.com/us/products/239716/"
+            "ishares-microcap-etf/1467271812596.ajax"
+            "?fileType=csv&fileName=IWC_holdings&dataType=fund"),
 }
 
-# Fallback: lista estatica caso o download dos ETFs falhe
+# Fallback de ultimo recurso (limpo de tickers deslistados conhecidos).
+# Nota: a verificacao de frescura (MAX_STALE_DAYS) protege mesmo que
+# algum destes venha a ser deslistado no futuro.
 FALLBACK_TICKERS = [
-    "RIVN","SIRI","LCID","HOOD","GRAB","HIMS","IONQ","JOBY","RKLB","BLNK",
-    "CHPT","EVGO","MVIS","BYND","NKLA","CLOV","SPCE","STEM","CLNE","GEVO",
-    "LAZR","OUST","OPEN","SKLZ","WKHS","XPEV","ZETA","MGNI","FSLY","LPSN",
-    "DOMO","BIGC","AEHR","HEAR","GILT","MNKD","NVTS","MTTR","MVST","MARK",
-    "AXSM","BEAM","BHVN","BNGO","ARCT","AGEN","AVIR","AMRX","ATRS","AVDL",
-    "AMPY","CRGY","CDEV","ARCH","BATL","PRPL","UWMC","ORGN","RIDE","ZVIA",
-    "COIN","RBLX","PTON","DKNG","MAPS","ACCD","EVBG","EXPI","CPSI","PESI",
-    "ATIP","ATLC","MFIN","ACNB","IONQ","RKLB","AEHR","HEAR","GILT","BLNK",
+    "HIMS","IONQ","JOBY","RKLB","BLNK","CHPT","EVGO","BYND","CLOV","STEM",
+    "GEVO","LAZR","OUST","OPEN","WKHS","ZETA","MGNI","FSLY","LPSN","BIGC",
+    "AEHR","GILT","MNKD","NVTS","MVST","AXSM","BEAM","ARCT","AGEN","AVDL",
+    "CRGY","ARCH","PRPL","UWMC","ORGN","ZVIA","DKNG","EXPI","ATLC","MFIN",
+    "ACNB","SPCE","SKLZ","PESI","AMPY","GRAB","HOOD","RIVN","LCID","SIRI",
 ]
 
 # --------------------------------------------------
-# OBTER TICKERS DOS ETFs DINAMICAMENTE
+# UNIVERSO DE TICKERS
 # --------------------------------------------------
 
-def get_etf_tickers(etf_symbols, max_tickers=MAX_TICKERS):
-    all_tickers = set()
-    for name, symbol in etf_symbols.items():
-        try:
-            etf = yf.Ticker(symbol)
-            holdings = etf.funds_data.top_holdings if hasattr(etf, 'funds_data') else None
-            if holdings is not None and not holdings.empty:
-                tickers = list(holdings.index)
-                all_tickers.update(tickers)
-                print("  ETF %s (%s): %d holdings obtidos" % (symbol, name, len(tickers)))
+def _parse_ishares_csv(text):
+    """Extrai tickers de equity do CSV de holdings da iShares.
+    O ficheiro tem ~9 linhas de metadados antes do cabecalho."""
+    tickers = []
+    reader = csv.reader(io.StringIO(text))
+    header_idx = None
+    rows = list(reader)
+    for i, row in enumerate(rows):
+        if row and row[0].strip().lower() == "ticker":
+            header_idx = i
+            break
+    if header_idx is None:
+        return []
+    header = [h.strip().lower() for h in rows[header_idx]]
+    try:
+        t_col = header.index("ticker")
+    except ValueError:
+        return []
+    a_col = header.index("asset class") if "asset class" in header else None
+    for row in rows[header_idx + 1:]:
+        if len(row) <= t_col:
+            continue
+        t = row[t_col].strip()
+        if a_col is not None and len(row) > a_col:
+            if "equity" not in row[a_col].strip().lower():
                 continue
-        except Exception:
-            pass
+        if t and t.isalpha() and 1 <= len(t) <= 5:
+            tickers.append(t.upper())
+    return tickers
 
-        # Metodo alternativo: usar yf.download para obter constituintes
+
+def get_universe(max_tickers=MAX_TICKERS):
+    all_tickers = set()
+
+    # 1) Fonte primaria: CSV completo da iShares
+    for symbol, url in ISHARES_CSV.items():
         try:
-            etf_data = yf.Ticker(symbol)
-            info = etf_data.info
-            # Tentar via fast_info
-            if hasattr(etf_data, 'funds_data'):
-                fd = etf_data.funds_data
-                if hasattr(fd, 'top_holdings') and fd.top_holdings is not None:
-                    tickers = list(fd.top_holdings.index)
-                    all_tickers.update(tickers)
-                    print("  ETF %s (%s): %d holdings obtidos" % (symbol, name, len(tickers)))
+            r = requests.get(url, timeout=30,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            ts = _parse_ishares_csv(r.text)
+            if len(ts) > 100:
+                all_tickers.update(ts)
+                print("  ETF %s: %d constituintes (CSV iShares)" % (symbol, len(ts)))
+            else:
+                print("  ETF %s: CSV devolveu apenas %d tickers - ignorado" % (symbol, len(ts)))
         except Exception as e:
-            print("  ETF %s: falhou (%s)" % (symbol, str(e)[:50]))
+            print("  ETF %s: CSV falhou (%s)" % (symbol, str(e)[:60]))
 
-    # Se nao conseguiu tickers suficientes, usar fallback
+    # 2) Fonte secundaria: top holdings via yfinance (limitado, mas algo)
+    if len(all_tickers) < 100:
+        for symbol in ISHARES_CSV:
+            try:
+                fd = yf.Ticker(symbol).funds_data
+                th = getattr(fd, "top_holdings", None)
+                if th is not None and not th.empty:
+                    all_tickers.update(list(th.index))
+                    print("  ETF %s: %d top holdings (yfinance)" % (symbol, len(th)))
+            except Exception:
+                pass
+
+    # 3) Ultimo recurso
     if len(all_tickers) < 50:
-        print("  Usando lista fallback (%d tickers)" % len(FALLBACK_TICKERS))
-        return FALLBACK_TICKERS
+        print("  AVISO: a usar lista fallback estatica (%d tickers). "
+              "Universo NAO esta actualizado." % len(FALLBACK_TICKERS))
+        return list(dict.fromkeys(FALLBACK_TICKERS))
 
-    # Filtrar tickers validos (sem caracteres especiais, 1-5 letras)
-    clean = [t for t in all_tickers
-             if isinstance(t, str) and t.isalpha() and 1 <= len(t) <= 5]
+    clean = sorted(t for t in all_tickers
+                   if isinstance(t, str) and t.isalpha() and 1 <= len(t) <= 5)
 
-    # Limitar ao maximo definido (aleatoriamente para variar dia a dia)
     if len(clean) > max_tickers:
         import random
-        random.seed(datetime.now().toordinal())  # seed pelo dia - mesmo resultado no mesmo dia
-        clean = random.sample(clean, max_tickers)
+        random.seed(datetime.now().toordinal())  # estavel dentro do mesmo dia
+        clean = sorted(random.sample(clean, max_tickers))
 
-    print("  Total universo: %d tickers unicos" % len(clean))
-    return sorted(clean)
+    print("  Total universo: %d tickers" % len(clean))
+    return clean
 
 # --------------------------------------------------
-# INDICADORES
+# INDICADORES (suavizacao de Wilder = convencao standard)
 # --------------------------------------------------
+
+def wilder_smooth(series, period):
+    """Suavizacao de Wilder exacta: seed = SMA dos primeiros `period`
+    valores, depois recursao prev*(n-1)/n + v/n. Coincide com os valores
+    de broker/TradingView (o ewm do pandas usa seed diferente)."""
+    vals = series.to_numpy(dtype=float)
+    out = np.full(len(vals), np.nan)
+    valid_idx = np.where(~np.isnan(vals))[0]
+    if len(valid_idx) < period:
+        return pd.Series(out, index=series.index)
+    seed_pos = valid_idx[period - 1]
+    prev = float(np.mean(vals[valid_idx[:period]]))
+    out[seed_pos] = prev
+    for i in range(seed_pos + 1, len(vals)):
+        v = vals[i]
+        if np.isnan(v):
+            continue
+        prev = (prev * (period - 1) + v) / period
+        out[i] = prev
+    return pd.Series(out, index=series.index)
 
 def compute_rsi(series, period=14):
     delta = series.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / loss.replace(0, np.nan)
+    gain = wilder_smooth(delta.clip(lower=0), period)
+    loss = wilder_smooth(-delta.clip(upper=0), period)
+    rs = gain / loss          # loss=0 -> rs=inf -> RSI=100 (correcto)
     return 100 - (100 / (1 + rs))
 
-def compute_atr(high, low, close, period=14):
-    tr = pd.concat([
+def true_range(high, low, close):
+    return pd.concat([
         high - low,
         (high - close.shift()).abs(),
-        (low  - close.shift()).abs()
+        (low - close.shift()).abs()
     ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+
+def compute_atr(high, low, close, period=14):
+    return wilder_smooth(true_range(high, low, close), period)
 
 def compute_macd(series):
-    ema12  = series.ewm(span=12, adjust=False).mean()
-    ema26  = series.ewm(span=26, adjust=False).mean()
-    macd   = ema12 - ema26
+    ema12 = series.ewm(span=12, adjust=False).mean()
+    ema26 = series.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
     signal = macd.ewm(span=9, adjust=False).mean()
-    hist   = macd - signal
-    return macd, signal, hist
+    return macd, signal, macd - signal
 
 def compute_bb(series, period=20, std=2.0):
-    mid   = series.rolling(period).mean()
-    sigma = series.rolling(period).std()
+    mid = series.rolling(period).mean()
+    sigma = series.rolling(period).std(ddof=0)   # convencao TA
     return mid + std * sigma, mid, mid - std * sigma
 
 def compute_adx(high, low, close, period=14):
-    up   = high.diff()
+    up = high.diff()
     down = -low.diff()
-    plus_dm  = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    atr      = compute_atr(high, low, close, period)
-    plus_di  = 100 * pd.Series(plus_dm,  index=close.index).rolling(period).mean() / atr
-    minus_di = 100 * pd.Series(minus_dm, index=close.index).rolling(period).mean() / atr
-    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
-    return dx.rolling(period).mean(), plus_di, minus_di
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0),
+                        index=close.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0),
+                         index=close.index)
+    atr = wilder_smooth(true_range(high, low, close), period)
+    plus_di = 100 * wilder_smooth(plus_dm, period) / atr
+    minus_di = 100 * wilder_smooth(minus_dm, period) / atr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = wilder_smooth(dx, period)
+    return adx, plus_di, minus_di
+
+# --------------------------------------------------
+# DOWNLOAD EM LOTE
+# --------------------------------------------------
+
+def download_batches(tickers, chunk_size=CHUNK_SIZE):
+    """Devolve dict ticker -> DataFrame OHLCV. Download em chunks para
+    reduzir rate-limiting e falhas silenciosas."""
+    data = {}
+    n_chunks = (len(tickers) + chunk_size - 1) // chunk_size
+    for ci in range(n_chunks):
+        chunk = tickers[ci * chunk_size:(ci + 1) * chunk_size]
+        print("  Download lote %d/%d (%d tickers)..." % (ci + 1, n_chunks, len(chunk)))
+        try:
+            raw = yf.download(chunk, period="1y", interval="1d",
+                              auto_adjust=True, group_by="ticker",
+                              threads=True, progress=False)
+        except Exception as e:
+            print("  Lote %d falhou: %s" % (ci + 1, str(e)[:60]))
+            continue
+        if raw is None or raw.empty:
+            continue
+        if len(chunk) == 1:
+            data[chunk[0]] = raw
+            continue
+        for t in chunk:
+            try:
+                sub = raw[t].dropna(how="all")
+                if not sub.empty:
+                    data[t] = sub
+            except KeyError:
+                pass
+    return data
 
 # --------------------------------------------------
 # ANALISE POR TICKER
 # --------------------------------------------------
 
-def analyse_ticker(ticker, mode="all"):
+def market_closed_utc(now=None):
+    """True se a sessao regular dos EUA ja fechou (conservador: 21:05 UTC
+    cobre EST; em EDT o fecho e 20:00 UTC)."""
+    now = now or datetime.now(timezone.utc)
+    return now.hour > 21 or (now.hour == 21 and now.minute >= 5)
+
+def analyse_ticker(ticker, df, today):
     try:
-        df = yf.download(ticker, period="1y", interval="1d",
-                         auto_adjust=True, progress=False)
-        if df is None or len(df) < 40:
+        if df is None or len(df) < 60:
             return None
 
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-
-        close  = df["Close"]
-        high   = df["High"]
-        low    = df["Low"]
-        volume = df["Volume"]
-
-        avg_vol = volume.iloc[-50:].mean()
-        if avg_vol < MIN_AVG_VOL:
+        df = df.dropna(subset=["Close", "High", "Low", "Volume"])
+        if len(df) < 60:
             return None
+
+        # --- Frescura: descartar barra do dia se a sessao ainda decorre
+        last_date = df.index[-1].date()
+        if last_date == today and not market_closed_utc():
+            df = df.iloc[:-1]
+            last_date = df.index[-1].date()
+
+        # --- Frescura: rejeitar dados velhos (ticker deslistado/suspenso)
+        if (today - last_date).days > MAX_STALE_DAYS:
+            return None
+
+        close, high, low = df["Close"], df["High"], df["Low"]
+        volume, opn = df["Volume"], df["Open"]
 
         c = float(close.iloc[-1])
         if c < MIN_PRICE or c > MAX_PRICE:
             return None
 
-        rsi                    = compute_rsi(close)
-        macd, macd_sig, mhist  = compute_macd(close)
-        atr                    = compute_atr(high, low, close)
-        bb_up, bb_mid, bb_low  = compute_bb(close)
+        # --- Liquidez em dolares (mediana 20d), nao em accoes
+        dollar_vol = float((close * volume).iloc[-20:].median())
+        if dollar_vol < MIN_DOLLAR_VOL:
+            return None
+
+        rsi = compute_rsi(close)
+        macd, macd_sig, mhist = compute_macd(close)
+        atr = compute_atr(high, low, close)
+        bb_up, bb_mid, bb_low = compute_bb(close)
         adx, plus_di, minus_di = compute_adx(high, low, close)
-        ema20  = close.ewm(span=20, adjust=False).mean()
-        ema50  = close.ewm(span=50, adjust=False).mean()
-        sma50  = close.rolling(50).mean()
+        ema20 = close.ewm(span=20, adjust=False).mean()
+        ema50 = close.ewm(span=50, adjust=False).mean()
+        sma50 = close.rolling(50).mean()
         sma200 = close.rolling(200).mean()
 
-        r     = float(rsi.iloc[-1])
-        r_1   = float(rsi.iloc[-2])
-        m     = float(macd.iloc[-1])
-        ms    = float(macd_sig.iloc[-1])
-        mh    = float(mhist.iloc[-1])
-        mh_1  = float(mhist.iloc[-2])
-        at    = float(atr.iloc[-1])
-        bbu   = float(bb_up.iloc[-1])
-        bbl   = float(bb_low.iloc[-1])
-        adxv  = float(adx.iloc[-1])
-        pdi   = float(plus_di.iloc[-1])
-        mdi   = float(minus_di.iloc[-1])
-        e20   = float(ema20.iloc[-1])
-        e50   = float(ema50.iloc[-1])
-        o     = float(df["Open"].iloc[-1])
-        vol_ratio = float(volume.iloc[-1]) / float(avg_vol)
+        r = float(rsi.iloc[-1])
+        m, ms = float(macd.iloc[-1]), float(macd_sig.iloc[-1])
+        mh, mh_1 = float(mhist.iloc[-1]), float(mhist.iloc[-2])
+        at = float(atr.iloc[-1])
+        bbu = float(bb_up.iloc[-1])
+        adxv = float(adx.iloc[-1])
+        pdi, mdi = float(plus_di.iloc[-1]), float(minus_di.iloc[-1])
+        e20, e50 = float(ema20.iloc[-1]), float(ema50.iloc[-1])
+        o = float(opn.iloc[-1])
+        h_, l_ = float(high.iloc[-1]), float(low.iloc[-1])
+        prev_c = float(close.iloc[-2])
+
+        if not np.isfinite(at) or at <= 0 or not np.isfinite(r):
+            return None
 
         atr_pct = (at / c) * 100
         if atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
             return None
 
-        s50       = float(sma50.iloc[-1])
-        s200_vals = sma200.dropna()
-        if len(s200_vals) >= 20:
-            golden_cross = s50 > float(s200_vals.iloc[-1])
-        else:
-            golden_cross = c > e50
+        avg_vol20 = float(volume.iloc[-20:].mean())
+        vol_ratio = float(volume.iloc[-1]) / avg_vol20 if avg_vol20 > 0 else 0.0
 
-        above_ema20    = (close.iloc[-10:] > ema20.iloc[-10:]).sum() / 10.0
-        bullish_candle = c > o
+        s200 = float(sma200.iloc[-1]) if not np.isnan(sma200.iloc[-1]) else None
+        s50 = float(sma50.iloc[-1]) if not np.isnan(sma50.iloc[-1]) else None
+        golden_cross = (s50 is not None and s200 is not None and s50 > s200)
 
-        # Score ponderado LONG
-        score   = 0.0
-        reasons = []
+        e50_slope_up = float(ema50.iloc[-1]) > float(ema50.iloc[-6])
+        hi20 = float(high.iloc[-21:-1].max())  # maximo 20d ANTERIOR a hoje
+        breakout20 = c > hi20
+        gap_pct = (o / prev_c - 1.0) * 100 if prev_c > 0 else 0.0
+        candle_range = max(h_ - l_, 1e-9)
+        close_pos = (c - l_) / candle_range   # posicao do fecho no range do dia
+        extension_atr = (c - e20) / at        # distancia a EMA20 em ATRs
 
-        if 35 < r < 55:
-            score += 1.5
-            reasons.append("RSI %.0f zona bullish" % r)
-        elif 55 <= r < 65:
-            score += 0.5
-            reasons.append("RSI %.0f aceitavel" % r)
+        # ---------------- SCORE (max teorico 10.0) ----------------
+        score, reasons, warns = 0.0, [], []
 
-        if r > r_1:
-            score += 0.5
-            reasons.append("RSI subindo")
-
-        if m > ms and mh > mh_1:
-            score += 2.0
-            reasons.append("MACD bullish + histograma crescente")
-        elif m > ms:
-            score += 1.0
-            reasons.append("MACD acima do sinal")
-
+        # Estrutura de tendencia (max 3.0)
         if c > e20 > e50:
-            score += 2.0
-            reasons.append("Preco > EMA20 > EMA50")
+            score += 1.5; reasons.append("Preco > EMA20 > EMA50")
         elif c > e20:
-            score += 1.0
-            reasons.append("Preco > EMA20")
-
+            score += 0.75; reasons.append("Preco > EMA20")
+        if e50_slope_up:
+            score += 0.5; reasons.append("EMA50 ascendente")
         if golden_cross:
-            score += 1.5
-            reasons.append("Tendencia macro bullish")
+            score += 1.0; reasons.append("SMA50 > SMA200")
 
+        # Momentum (max 2.5)
+        if m > ms and mh > mh_1:
+            score += 1.5; reasons.append("MACD bullish, histograma crescente")
+        elif m > ms:
+            score += 0.75; reasons.append("MACD acima do sinal")
+        if 45 <= r <= 65:
+            score += 1.0; reasons.append("RSI %.0f saudavel" % r)
+        elif 35 <= r < 45:
+            score += 0.5; reasons.append("RSI %.0f recuperacao" % r)
+
+        # Forca da tendencia (max 1.5)
         if adxv > 25 and pdi > mdi:
-            score += 1.5
-            reasons.append("ADX %.0f forte bullish" % adxv)
+            score += 1.5; reasons.append("ADX %.0f forte" % adxv)
         elif adxv > 20 and pdi > mdi:
-            score += 0.75
-            reasons.append("ADX %.0f moderado bullish" % adxv)
+            score += 0.75; reasons.append("ADX %.0f moderado" % adxv)
 
-        if vol_ratio > 2.0:
-            score += 1.0
-            reasons.append("Volume %.1fx confirmacao forte" % vol_ratio)
-        elif vol_ratio > 1.3:
-            score += 0.5
-            reasons.append("Volume %.1fx acima media" % vol_ratio)
+        # Confirmacao de volume (max 1.5)
+        if vol_ratio >= 2.0:
+            score += 1.5; reasons.append("Volume %.1fx" % vol_ratio)
+        elif vol_ratio >= 1.3:
+            score += 0.75; reasons.append("Volume %.1fx" % vol_ratio)
 
-        if bullish_candle:
-            score += 0.5
-            reasons.append("Candle bullish")
+        # Price action (max 1.5)
+        if breakout20 and vol_ratio >= 1.3:
+            score += 1.0; reasons.append("Breakout max 20d c/ volume")
+        if c > o and close_pos >= 0.66:
+            score += 0.5; reasons.append("Fecho no terco superior")
 
-        if above_ema20 >= 0.7:
-            score += 0.5
-            reasons.append("%.0f%% dias acima EMA20" % (above_ema20 * 100))
-
-        warnings = []
-        if c > bbu * 0.97:
-            score -= 1.5
-            warnings.append("Perto resistencia BB")
+        # ---------------- PENALIZACOES ----------------
+        if extension_atr > 2.0:
+            score -= 1.5; warns.append("Sobre-extendido (%.1f ATR acima EMA20)" % extension_atr)
+        if c > bbu:
+            score -= 1.0; warns.append("Acima da banda Bollinger superior")
+        if gap_pct > 4.0:
+            score -= 1.0; warns.append("Gap-up %.1f%% (risco de perseguir)" % gap_pct)
+        if s200 is not None and c < s200:
+            score -= 1.0; warns.append("Abaixo da SMA200")
+        if atr_pct > 8.0:
+            score -= 0.5; warns.append("ATR %.1f%% elevado" % atr_pct)
 
         if score < MIN_SCORE:
             return None
 
-        is_day     = (r < 35) and (vol_ratio > 1.5) and (c < bbl * 1.01)
-        trade_type = "DAY" if is_day else "SWING"
-
-        if mode == "day"   and trade_type != "DAY":   return None
-        if mode == "swing" and trade_type != "SWING": return None
-
-        entry  = c
-        stop   = round(entry - at * STOP_ATR_MULT, 2)
-        risk   = entry - stop
-        target = round(entry + risk * TARGET_RR, 2)
-        rr     = round(abs(target - entry) / abs(stop - entry), 2)
+        entry = c
+        stop = round(entry - at * STOP_ATR_MULT, 2)
+        if stop <= 0:
+            return None
+        target = round(entry + (entry - stop) * TARGET_RR, 2)
+        rr = round((target - entry) / (entry - stop), 2)
 
         return {
-            "ticker":   ticker,
-            "tipo":     trade_type,
-            "preco":    round(c, 2),
-            "entrada":  round(entry, 2),
-            "stop":     stop,
-            "target":   round(target, 2),
-            "rr":       rr,
-            "score":    round(score, 1),
-            "vol_rel":  round(vol_ratio, 2),
-            "rsi":      round(r, 1),
-            "atr_pct":  round(atr_pct, 2),
-            "reasons":  reasons,
-            "warnings": warnings,
+            "ticker": ticker, "preco": round(c, 2), "entrada": round(entry, 2),
+            "stop": stop, "target": target, "rr": rr,
+            "score": round(score, 1), "vol_rel": round(vol_ratio, 2),
+            "rsi": round(r, 1), "atr_pct": round(atr_pct, 2),
+            "dollar_vol_m": round(dollar_vol / 1e6, 1),
+            "reasons": reasons, "warnings": warns,
         }
-
     except Exception:
         return None
+
+# --------------------------------------------------
+# EARNINGS PROXIMOS (so para finalistas - chamadas lentas)
+# --------------------------------------------------
+
+def flag_upcoming_earnings(signals, days=7):
+    today = datetime.now(timezone.utc).date()
+    for s in signals:
+        try:
+            cal = yf.Ticker(s["ticker"]).calendar
+            dates = []
+            if isinstance(cal, dict):
+                ed = cal.get("Earnings Date")
+                if ed:
+                    dates = ed if isinstance(ed, (list, tuple)) else [ed]
+            for d in dates:
+                d = d.date() if hasattr(d, "date") else d
+                delta = (d - today).days
+                if 0 <= delta <= days:
+                    s["warnings"].append("EARNINGS em %d dia(s)" % delta)
+                    break
+        except Exception:
+            pass
+    return signals
 
 # --------------------------------------------------
 # TELEGRAM
 # --------------------------------------------------
 
 def send_telegram(message):
-    token   = os.environ.get("TELEGRAM_TOKEN")
+    token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         return
-    url    = "https://api.telegram.org/bot%s/sendMessage" % token
-    chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
-    for chunk in chunks:
+    url = "https://api.telegram.org/bot%s/sendMessage" % token
+    for i in range(0, len(message), 4000):
         try:
-            requests.post(url, data={"chat_id": chat_id, "text": chunk,
+            requests.post(url, data={"chat_id": chat_id,
+                                     "text": message[i:i + 4000],
                                      "parse_mode": "Markdown"}, timeout=10)
         except Exception as e:
             print("Erro Telegram: %s" % e)
 
-def format_for_telegram(signals, n_scanned):
+def format_for_telegram(signals, n_scanned, n_data):
     date_str = datetime.now().strftime("%d/%m/%Y")
-    lines = [
-        "*SMALL/MICRO CAP - SINAIS DO DIA*",
-        "_%s | %d acoes analisadas_" % (date_str, n_scanned),
-        ""
-    ]
+    lines = ["*SMALL/MICRO CAP - SINAIS DO DIA (v9)*",
+             "_%s | %d analisadas (%d com dados validos)_" % (date_str, n_scanned, n_data),
+             ""]
     for s in signals:
-        tipo = "DAY" if s["tipo"] == "DAY" else "SWING"
         warn = " [!]" if s["warnings"] else ""
-        lines.append("*%s* | BUY | %s | Score: %.1f%s" % (
-            s["ticker"], tipo, s["score"], warn))
+        lines.append("*%s* | BUY | Score: %.1f%s" % (s["ticker"], s["score"], warn))
         lines.append("  Entrada: `$%s` | Stop: `$%s` | Target: `$%s` | RR: `%sx`" % (
             s["entrada"], s["stop"], s["target"], s["rr"]))
-        lines.append("  RSI: `%s` | Vol: `%sx` | ATR: `%s%%`" % (
-            s["rsi"], s["vol_rel"], s["atr_pct"]))
+        lines.append("  RSI: `%s` | Vol: `%sx` | ATR: `%s%%` | Liq: `$%sM/dia`" % (
+            s["rsi"], s["vol_rel"], s["atr_pct"], s["dollar_vol_m"]))
+        if s["warnings"]:
+            lines.append("  Avisos: %s" % "; ".join(s["warnings"]))
         lines.append("")
     lines.append("_Apenas referencia. Nao e aconselhamento financeiro._")
     return "\n".join(lines)
@@ -348,91 +488,79 @@ def format_for_telegram(signals, n_scanned):
 # OUTPUT TERMINAL
 # --------------------------------------------------
 
-def print_header(n_tickers):
-    print("\n" + "="*70)
-    print("  SCANNER v6 - Small/Micro Cap | Preco: $%.0f-$%.0f | Vol min: %dk" % (
-        MIN_PRICE, MAX_PRICE, MIN_AVG_VOL // 1000))
-    print("  %s | Fonte: Russell 2000 (IWM) + Micro Cap (IWC)" % (
-        datetime.now().strftime("%d/%m/%Y %H:%M")))
-    print("="*70 + "\n")
+def print_header():
+    print("\n" + "=" * 70)
+    print("  SCANNER v9 - Small/Micro Cap | $%.0f-$%.0f | Liq min: $%.0fM/dia" % (
+        MIN_PRICE, MAX_PRICE, MIN_DOLLAR_VOL / 1e6))
+    print("  %s | Universo: IWM + IWC (CSV iShares)" % datetime.now().strftime("%d/%m/%Y %H:%M"))
+    print("=" * 70 + "\n")
 
 def print_signal(s, idx):
-    t_color = Fore.YELLOW if s["tipo"] == "DAY" else Fore.CYAN
-    w_str   = (" | AVISO: " + " | ".join(s["warnings"])) if s["warnings"] else ""
-    print("-"*65)
-    print("  #%-3d %-8s | BUY | %s | Score: %.1f/10%s" % (
-        idx, s["ticker"],
-        t_color + s["tipo"] + Style.RESET_ALL,
-        s["score"],
-        Fore.YELLOW + w_str + Style.RESET_ALL))
-    print("       Preco  : $%s  (ATR: %s%%)" % (s["preco"], s["atr_pct"]))
+    w = (" | AVISO: " + " | ".join(s["warnings"])) if s["warnings"] else ""
+    print("-" * 65)
+    print("  #%-3d %-8s | BUY | SWING | Score: %.1f/10%s" % (
+        idx, s["ticker"], s["score"], Fore.YELLOW + w + Style.RESET_ALL))
+    print("       Preco  : $%s  (ATR: %s%% | Liq: $%sM/dia)" % (
+        s["preco"], s["atr_pct"], s["dollar_vol_m"]))
     print("  >>   Target : $%s" % s["target"])
     print("  XX   Stop   : $%s" % s["stop"])
     print("       R/R: %sx  RSI: %s  Vol: %sx" % (s["rr"], s["rsi"], s["vol_rel"]))
     print("       " + " | ".join(s["reasons"]))
 
 def print_table(signals):
-    rows = [[
-        s["ticker"], s["tipo"],
-        "$%s" % s["preco"], "$%s" % s["stop"],
-        "$%s" % s["target"], "%sx" % s["rr"],
-        "%.1f" % s["score"], "%s%%" % s["atr_pct"]
-    ] for s in signals]
-    headers = ["Ticker","Tipo","Preco","Stop","Target","R/R","Score","ATR%"]
-    print(tabulate(rows, headers=headers, tablefmt="rounded_outline"))
+    rows = [[s["ticker"], "$%s" % s["preco"], "$%s" % s["stop"],
+             "$%s" % s["target"], "%sx" % s["rr"], "%.1f" % s["score"],
+             "%s%%" % s["atr_pct"], "$%sM" % s["dollar_vol_m"]] for s in signals]
+    print(tabulate(rows, headers=["Ticker", "Preco", "Stop", "Target",
+                                  "R/R", "Score", "ATR%", "Liq/dia"],
+                   tablefmt="rounded_outline"))
 
 # --------------------------------------------------
 # MAIN
 # --------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Trading Scanner v6")
-    parser.add_argument("--mode",  choices=["all","day","swing"], default="all")
-    parser.add_argument("--top",   type=int, default=10)
+    parser = argparse.ArgumentParser(description="Trading Scanner v9")
+    parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--table", action="store_true")
+    parser.add_argument("--max-tickers", type=int, default=MAX_TICKERS)
     args = parser.parse_args()
 
     telegram_mode = bool(os.environ.get("TELEGRAM_TOKEN"))
+    today = datetime.now(timezone.utc).date()
 
-    print_header(0)
-    print("  A obter universo de tickers via ETFs...\n")
+    print_header()
+    print("  A obter universo de tickers...\n")
+    tickers = get_universe(args.max_tickers)
 
-    tickers = get_etf_tickers(ETF_SOURCES, MAX_TICKERS)
+    print("\n  A descarregar dados de %d tickers...\n" % len(tickers))
+    data = download_batches(tickers)
+    n_data = len(data)
+    print("  Dados validos: %d/%d tickers\n" % (n_data, len(tickers)))
+    if n_data < len(tickers) * 0.5:
+        print("  AVISO: >50%% dos downloads falharam - possivel rate-limit. "
+              "Resultados de hoje podem estar incompletos.\n")
 
-    print("\n  A analisar %d tickers...\n" % len(tickers))
-
-    signals   = []
-    n_scanned = 0
-    for i, ticker in enumerate(tickers, 1):
-        print("\r  Progresso: %d/%d - %-8s | Sinais: %d" % (
-            i, len(tickers), ticker, len(signals)),
-            end="", flush=True)
-        result = analyse_ticker(ticker, mode=args.mode)
-        n_scanned += 1
+    signals = []
+    for i, (ticker, df) in enumerate(sorted(data.items()), 1):
+        print("\r  Analise: %d/%d - %-8s | Sinais: %d" % (
+            i, n_data, ticker, len(signals)), end="", flush=True)
+        result = analyse_ticker(ticker, df, today)
         if result:
             signals.append(result)
-
-    print("\r" + " "*65 + "\r", end="")
+    print("\r" + " " * 65 + "\r", end="")
 
     if not signals:
         print("  Nenhum sinal encontrado hoje.")
         if telegram_mode:
-            send_telegram("*SMALL CAP SCANNER - %s*\n\n_%d acoes analisadas._\nNenhum sinal encontrado hoje." % (
-                datetime.now().strftime("%d/%m/%Y"), n_scanned))
+            send_telegram("*SMALL CAP SCANNER v9 - %s*\n\n_%d analisadas (%d com dados)._\n"
+                          "Nenhum sinal encontrado hoje." % (
+                              datetime.now().strftime("%d/%m/%Y"), len(tickers), n_data))
         return
 
     signals.sort(key=lambda x: (x["score"], x["rr"]), reverse=True)
-
-    # Remover duplicados (mesmo ticker pode aparecer 2x se estiver em dois ETFs)
-    seen_tickers = set()
-    unique_signals = []
-    for s in signals:
-        if s["ticker"] not in seen_tickers:
-            seen_tickers.add(s["ticker"])
-            unique_signals.append(s)
-    signals = unique_signals
-
     top_signals = signals[:args.top]
+    top_signals = flag_upcoming_earnings(top_signals)
 
     if args.table:
         print_table(top_signals)
@@ -440,19 +568,15 @@ def main():
         for idx, s in enumerate(top_signals, 1):
             print_signal(s, idx)
 
-    n_day  = sum(1 for s in top_signals if s["tipo"] == "DAY")
-    n_sw   = sum(1 for s in top_signals if s["tipo"] == "SWING")
     n_warn = sum(1 for s in top_signals if s["warnings"])
-
-    print("\n" + "="*65)
-    print("  SUMARIO: %d sinais BUY (de %d analisadas) | DAY: %d | SWING: %d | Avisos: %d" % (
-        len(signals), n_scanned, n_day, n_sw, n_warn))
-    print("="*65)
+    print("\n" + "=" * 65)
+    print("  SUMARIO: %d sinais BUY (de %d com dados validos) | Avisos: %d" % (
+        len(signals), n_data, n_warn))
+    print("=" * 65)
     print("  Nao constitui aconselhamento financeiro.\n")
 
     if telegram_mode:
-        msg = format_for_telegram(top_signals, n_scanned)
-        send_telegram(msg)
+        send_telegram(format_for_telegram(top_signals, len(tickers), n_data))
         print("  Mensagem enviada ao Telegram!\n")
 
 if __name__ == "__main__":
