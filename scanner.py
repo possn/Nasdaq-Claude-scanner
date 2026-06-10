@@ -66,7 +66,9 @@ STOP_ATR_MULT   = 1.5
 TARGET_RR       = 2.0
 MIN_SCORE       = 5.0
 MIN_DOLLAR_VOL  = 2_000_000   # mediana 20d de close*volume (USD)
-MIN_ATR_PCT     = 0.5
+MIN_ATR_PCT     = 2.0   # v10.1: 0.5 deixava passar stops de centimos (CCO:
+                        # stop $0.02 em accao de $2.41, abaixo do spread).
+                        # ATR>=2% garante stop 1.5xATR >= 3% - transaccionavel.
 MAX_ATR_PCT     = 8.0   # stop 1.5xATR fica <=12% (v9 permitia 18%)
 MIN_PRICE       = 2.0
 MAX_PRICE       = 50.0
@@ -545,7 +547,7 @@ def send_telegram(message):
 
 def format_for_telegram(signals, n_scanned, n_data):
     date_str = datetime.now().strftime("%d/%m/%Y")
-    lines = ["*SMALL/MICRO CAP - SINAIS DO DIA (v10)*",
+    lines = ["*SMALL/MICRO CAP - SINAIS DO DIA (v10.1)*",
              "_%s | %d analisadas (%d com dados validos)_" % (date_str, n_scanned, n_data),
              ""]
     for s in signals:
@@ -567,7 +569,7 @@ def format_for_telegram(signals, n_scanned, n_data):
 
 def print_header():
     print("\n" + "=" * 70)
-    print("  SCANNER v10 - Small/Micro Cap | $%.0f-$%.0f | Liq min: $%.0fM/dia" % (
+    print("  SCANNER v10.1 - Small/Micro Cap | $%.0f-$%.0f | Liq min: $%.0fM/dia" % (
         MIN_PRICE, MAX_PRICE, MIN_DOLLAR_VOL / 1e6))
     print("  %s | Universo: screener Yahoo (mcap $50M-$2B)" % datetime.now().strftime("%d/%m/%Y %H:%M"))
     print("=" * 70 + "\n")
@@ -630,7 +632,7 @@ def main():
     if not signals:
         print("  Nenhum sinal encontrado hoje.")
         if telegram_mode:
-            send_telegram("*SMALL CAP SCANNER v10 - %s*\n\n_%d analisadas (%d com dados)._\n"
+            send_telegram("*SMALL CAP SCANNER v10.1 - %s*\n\n_%d analisadas (%d com dados)._\n"
                           "Nenhum sinal encontrado hoje." % (
                               datetime.now().strftime("%d/%m/%Y"), len(tickers), n_data))
         return
