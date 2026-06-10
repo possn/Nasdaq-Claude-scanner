@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Trading Scanner v9 - Small/Micro Cap
+# Trading Scanner v10 - Small/Micro Cap
+#
+# ALTERACOES v10 (apos primeiro run em producao da v9):
+#  A. Universo: fonte primaria passa a ser o screener nativo do Yahoo
+#     (yf.screen + EquityQuery) - mesmo backend dos downloads de precos,
+#     pelo que funciona no GitHub Actions onde o CSV da iShares foi
+#     bloqueado (v9 caiu no fallback de 50 tickers: "50 analisadas").
+#     Query: US, mcap $50M-$2B, preco $2-$50, vol3m > 200k, ordenado por
+#     liquidez. iShares CSV passa a fonte secundaria.
+#  B. Filtros duros novos (na v9 eram apenas penalizacoes e nao chegaram):
+#     RSI > 70 rejeitado (CLOV passou com 77.4);
+#     extensao > 3 ATR acima da EMA20 rejeitada (CLOV: 4.0);
+#     volume do dia < 0.6x media rejeitado (SKLZ passou com 0.31x).
+#  C. MAX_ATR_PCT 12 -> 8: na v9 o SKLZ passou com ATR 11.9%, implicando
+#     stop de ~18% - risco por trade intransaccionavel em swing.
 #
 # ALTERACOES v9 (correccao de precisao):
 #  1. Universo real: holdings completos via CSV oficial iShares (IWM/IWC),
@@ -53,7 +67,7 @@ TARGET_RR       = 2.0
 MIN_SCORE       = 5.0
 MIN_DOLLAR_VOL  = 2_000_000   # mediana 20d de close*volume (USD)
 MIN_ATR_PCT     = 0.5
-MAX_ATR_PCT     = 12.0
+MAX_ATR_PCT     = 8.0   # stop 1.5xATR fica <=12% (v9 permitia 18%)
 MIN_PRICE       = 2.0
 MAX_PRICE       = 50.0
 MAX_TICKERS     = 400
@@ -116,25 +130,78 @@ def _parse_ishares_csv(text):
     return tickers
 
 
-def get_universe(max_tickers=MAX_TICKERS):
-    all_tickers = set()
+def get_universe_yahoo_screener(max_tickers):
+    """Fonte primaria: screener nativo do Yahoo via yfinance (mesmo backend
+    dos downloads de precos - se um funciona no runner, o outro tambem).
+    Small/micro caps US, ordenadas por volume medio 3m (mais liquidas 1o)."""
+    try:
+        from yfinance import EquityQuery
+    except ImportError:
+        return []
+    if not hasattr(yf, "screen"):
+        return []
+    q = EquityQuery("and", [
+        EquityQuery("eq", ["region", "us"]),
+        EquityQuery("is-in", ["exchange", "NMS", "NGM", "NCM", "NYQ", "ASE"]),
+        EquityQuery("btwn", ["intradaymarketcap", 50_000_000, 2_000_000_000]),
+        EquityQuery("btwn", ["intradayprice", MIN_PRICE, MAX_PRICE]),
+        EquityQuery("gt", ["avgdailyvol3m", 200_000]),
+    ])
+    tickers = []
+    for offset in range(0, 1000, 250):   # Yahoo: max 250 por chamada
+        try:
+            resp = yf.screen(q, offset=offset, size=250,
+                             sortField="avgdailyvol3m", sortAsc=False)
+            quotes = (resp or {}).get("quotes", [])
+            if not quotes:
+                break
+            tickers.extend(qt.get("symbol", "") for qt in quotes)
+            if len(tickers) >= max_tickers:
+                break
+        except Exception as e:
+            print("  Screener Yahoo (offset %d): falhou (%s)" % (offset, str(e)[:60]))
+            break
+    clean = []
+    seen = set()
+    for t in tickers:
+        if t and t.isalpha() and 1 <= len(t) <= 5 and t not in seen:
+            seen.add(t)
+            clean.append(t)
+    return clean[:max_tickers]
 
-    # 1) Fonte primaria: CSV completo da iShares
+
+def get_universe(max_tickers=MAX_TICKERS):
+    # 1) Fonte primaria: screener Yahoo (small/micro cap, ja filtrado
+    #    por preco e mcap, ordenado por liquidez)
+    ts = get_universe_yahoo_screener(max_tickers)
+    if len(ts) >= 100:
+        print("  Screener Yahoo: %d tickers small/micro cap" % len(ts))
+        return sorted(ts)
+    print("  Screener Yahoo devolveu %d tickers - a tentar CSV iShares..." % len(ts))
+
+    all_tickers = set(ts)
+
+    # 2) Fonte secundaria: CSV completo da iShares (pode ser bloqueado
+    #    por anti-bot em runners de CI)
     for symbol, url in ISHARES_CSV.items():
         try:
-            r = requests.get(url, timeout=30,
-                             headers={"User-Agent": "Mozilla/5.0"})
+            r = requests.get(url, timeout=30, headers={
+                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/124.0 Safari/537.36"),
+                "Accept": "text/csv,*/*",
+            })
             r.raise_for_status()
-            ts = _parse_ishares_csv(r.text)
-            if len(ts) > 100:
-                all_tickers.update(ts)
-                print("  ETF %s: %d constituintes (CSV iShares)" % (symbol, len(ts)))
+            ts2 = _parse_ishares_csv(r.text)
+            if len(ts2) > 100:
+                all_tickers.update(ts2)
+                print("  ETF %s: %d constituintes (CSV iShares)" % (symbol, len(ts2)))
             else:
-                print("  ETF %s: CSV devolveu apenas %d tickers - ignorado" % (symbol, len(ts)))
+                print("  ETF %s: CSV devolveu apenas %d tickers - ignorado" % (symbol, len(ts2)))
         except Exception as e:
             print("  ETF %s: CSV falhou (%s)" % (symbol, str(e)[:60]))
 
-    # 2) Fonte secundaria: top holdings via yfinance (limitado, mas algo)
+    # 3) Fonte terciaria: top holdings via yfinance (limitado, mas algo)
     if len(all_tickers) < 100:
         for symbol in ISHARES_CSV:
             try:
@@ -146,7 +213,7 @@ def get_universe(max_tickers=MAX_TICKERS):
             except Exception:
                 pass
 
-    # 3) Ultimo recurso
+    # 4) Ultimo recurso
     if len(all_tickers) < 50:
         print("  AVISO: a usar lista fallback estatica (%d tickers). "
               "Universo NAO esta actualizado." % len(FALLBACK_TICKERS))
@@ -350,6 +417,16 @@ def analyse_ticker(ticker, df, today):
         close_pos = (c - l_) / candle_range   # posicao do fecho no range do dia
         extension_atr = (c - e20) / at        # distancia a EMA20 em ATRs
 
+        # ---------------- FILTROS DUROS (rejeicao, nao penalizacao) ------
+        # Licao da v9 em producao: CLOV passou com RSI 77 + 4 ATR acima da
+        # EMA20 (penalizacoes nao chegaram); SKLZ passou com volume 0.31x.
+        if r > 70:
+            return None          # perseguir sobrecompra nao e setup de swing
+        if extension_atr > 3.0:
+            return None          # demasiado esticado; reversao a media provavel
+        if vol_ratio < 0.6:
+            return None          # dia sem participacao = sem confirmacao
+
         # ---------------- SCORE (max teorico 10.0) ----------------
         score, reasons, warns = 0.0, [], []
 
@@ -468,7 +545,7 @@ def send_telegram(message):
 
 def format_for_telegram(signals, n_scanned, n_data):
     date_str = datetime.now().strftime("%d/%m/%Y")
-    lines = ["*SMALL/MICRO CAP - SINAIS DO DIA (v9)*",
+    lines = ["*SMALL/MICRO CAP - SINAIS DO DIA (v10)*",
              "_%s | %d analisadas (%d com dados validos)_" % (date_str, n_scanned, n_data),
              ""]
     for s in signals:
@@ -490,9 +567,9 @@ def format_for_telegram(signals, n_scanned, n_data):
 
 def print_header():
     print("\n" + "=" * 70)
-    print("  SCANNER v9 - Small/Micro Cap | $%.0f-$%.0f | Liq min: $%.0fM/dia" % (
+    print("  SCANNER v10 - Small/Micro Cap | $%.0f-$%.0f | Liq min: $%.0fM/dia" % (
         MIN_PRICE, MAX_PRICE, MIN_DOLLAR_VOL / 1e6))
-    print("  %s | Universo: IWM + IWC (CSV iShares)" % datetime.now().strftime("%d/%m/%Y %H:%M"))
+    print("  %s | Universo: screener Yahoo (mcap $50M-$2B)" % datetime.now().strftime("%d/%m/%Y %H:%M"))
     print("=" * 70 + "\n")
 
 def print_signal(s, idx):
@@ -520,7 +597,7 @@ def print_table(signals):
 # --------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Trading Scanner v9")
+    parser = argparse.ArgumentParser(description="Trading Scanner v10")
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--table", action="store_true")
     parser.add_argument("--max-tickers", type=int, default=MAX_TICKERS)
@@ -553,7 +630,7 @@ def main():
     if not signals:
         print("  Nenhum sinal encontrado hoje.")
         if telegram_mode:
-            send_telegram("*SMALL CAP SCANNER v9 - %s*\n\n_%d analisadas (%d com dados)._\n"
+            send_telegram("*SMALL CAP SCANNER v10 - %s*\n\n_%d analisadas (%d com dados)._\n"
                           "Nenhum sinal encontrado hoje." % (
                               datetime.now().strftime("%d/%m/%Y"), len(tickers), n_data))
         return
