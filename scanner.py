@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Trading Scanner v10 - Small/Micro Cap
+# Trading Scanner v10.2 - Small/Micro Cap
+#
+# ALTERACOES v10.2 (modos de execucao):
+#  - Modo PRE-FECHO: corre na janela 15:10-15:59 ET com a barra parcial
+#    do dia (volume pro-rateado pela fraccao da sessao, estimativa
+#    conservadora) para permitir entrada nos minutos finais a preco ~=
+#    ao do sinal, sem exposicao ao gap overnight na decisao de entrada.
+#  - Modo POS-FECHO: comportamento anterior (dados finais, entrada no
+#    dia seguinte).
+#  - --mode auto (default): decide pela hora de Nova Iorque; o cron
+#    pre-fecho da estacao DST errada aborta sozinho.
+#  - Data da sessao passa a ser a data de NY (corrigia bug latente em
+#    execucoes manuais 00:00-01:00 Lisboa, em que a data UTC ja era
+#    "amanha" face a sessao de NY ainda a decorrer).
 #
 # ALTERACOES v10 (apos primeiro run em producao da v9):
 #  A. Universo: fonte primaria passa a ser o screener nativo do Yahoo
@@ -342,7 +355,45 @@ def market_closed_utc(now=None):
     now = now or datetime.now(timezone.utc)
     return now.hour > 21 or (now.hour == 21 and now.minute >= 5)
 
-def analyse_ticker(ticker, df, today):
+
+def ny_now():
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York"))
+
+
+def ny_session_fraction(now=None):
+    """Fraccao decorrida da sessao regular NYSE/Nasdaq (09:30-16:00 ET)."""
+    now = now or ny_now()
+    open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now <= open_t:
+        return 0.0
+    if now >= close_t:
+        return 1.0
+    return (now - open_t).total_seconds() / 23400.0
+
+
+def resolve_mode(requested, now=None):
+    """Determina o modo de execucao pela hora de Nova Iorque.
+    'preclose': 15:10-15:59 ET em dia util - usa a barra parcial de hoje,
+                para entrada nos minutos finais da sessao.
+    'postclose': apos o fecho (ou fim de semana/madrugada) - dados finais,
+                para entrada no dia seguinte.
+    None: sessao a decorrer fora da janela pre-fecho - abortar (um sinal
+          calculado a meio da sessao fica obsoleto ate ao fecho). O cron
+          pre-fecho da estacao DST errada cai aqui e termina sozinho."""
+    now = now or ny_now()
+    if requested in ("preclose", "postclose"):
+        return requested
+    t = now.hour * 60 + now.minute
+    weekday = now.weekday() < 5
+    if weekday and (15 * 60 + 10) <= t < (16 * 60):
+        return "preclose"
+    if (not weekday) or t >= (16 * 60 + 5) or t < (9 * 60 + 30):
+        return "postclose"
+    return None
+
+def analyse_ticker(ticker, df, today, mode="postclose", session_frac=1.0):
     try:
         if df is None or len(df) < 60:
             return None
@@ -353,11 +404,17 @@ def analyse_ticker(ticker, df, today):
         if len(df) < 60:
             return None
 
-        # --- Frescura: descartar barra do dia se a sessao ainda decorre
         last_date = df.index[-1].date()
-        if last_date == today and not market_closed_utc():
-            df = df.iloc[:-1]
-            last_date = df.index[-1].date()
+        if mode == "preclose":
+            # Exige a barra (parcial) de HOJE: sem ela, o preco de entrada
+            # estaria desactualizado um dia.
+            if last_date != today:
+                return None
+        else:
+            # Pos-fecho: descartar barra do dia se a sessao ainda decorre
+            if last_date == today and not market_closed_utc():
+                df = df.iloc[:-1]
+                last_date = df.index[-1].date()
 
         # --- Frescura: rejeitar dados velhos (ticker deslistado/suspenso)
         if (today - last_date).days > MAX_STALE_DAYS:
@@ -371,7 +428,11 @@ def analyse_ticker(ticker, df, today):
             return None
 
         # --- Liquidez em dolares (mediana 20d), nao em accoes
-        dollar_vol = float((close * volume).iloc[-20:].median())
+        if mode == "preclose":
+            # excluir a barra parcial de hoje das medias historicas
+            dollar_vol = float((close * volume).iloc[-21:-1].median())
+        else:
+            dollar_vol = float((close * volume).iloc[-20:].median())
         if dollar_vol < MIN_DOLLAR_VOL:
             return None
 
@@ -404,8 +465,16 @@ def analyse_ticker(ticker, df, today):
         if atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
             return None
 
-        avg_vol20 = float(volume.iloc[-20:].mean())
-        vol_ratio = float(volume.iloc[-1]) / avg_vol20 if avg_vol20 > 0 else 0.0
+        if mode == "preclose":
+            # Volume parcial pro-rateado pela fraccao da sessao decorrida.
+            # Conservador: o leilao de fecho ainda adiciona volume, pelo
+            # que isto tende a SUBestimar o racio final.
+            avg_vol20 = float(volume.iloc[-21:-1].mean())
+            vol_today_est = float(volume.iloc[-1]) / max(session_frac, 0.5)
+            vol_ratio = vol_today_est / avg_vol20 if avg_vol20 > 0 else 0.0
+        else:
+            avg_vol20 = float(volume.iloc[-20:].mean())
+            vol_ratio = float(volume.iloc[-1]) / avg_vol20 if avg_vol20 > 0 else 0.0
 
         s200 = float(sma200.iloc[-1]) if not np.isnan(sma200.iloc[-1]) else None
         s50 = float(sma50.iloc[-1]) if not np.isnan(sma50.iloc[-1]) else None
@@ -545,10 +614,11 @@ def send_telegram(message):
         except Exception as e:
             print("Erro Telegram: %s" % e)
 
-def format_for_telegram(signals, n_scanned, n_data):
+def format_for_telegram(signals, n_scanned, n_data, mode_label=""):
     date_str = datetime.now().strftime("%d/%m/%Y")
-    lines = ["*SMALL/MICRO CAP - SINAIS DO DIA (v10.1)*",
-             "_%s | %d analisadas (%d com dados validos)_" % (date_str, n_scanned, n_data),
+    lines = ["*SMALL/MICRO CAP - SINAIS DO DIA (v10.2)*",
+             "_%s | %s_" % (date_str, mode_label),
+             "_%d analisadas (%d com dados validos)_" % (n_scanned, n_data),
              ""]
     for s in signals:
         warn = " [!]" if s["warnings"] else ""
@@ -560,6 +630,9 @@ def format_for_telegram(signals, n_scanned, n_data):
         if s["warnings"]:
             lines.append("  Avisos: %s" % "; ".join(s["warnings"]))
         lines.append("")
+    if "PRE-FECHO" in mode_label:
+        lines.append("_Barra do dia provisoria; volume pro-rateado. "
+                     "Confirmar preco antes de entrar._")
     lines.append("_Apenas referencia. Nao e aconselhamento financeiro._")
     return "\n".join(lines)
 
@@ -569,7 +642,7 @@ def format_for_telegram(signals, n_scanned, n_data):
 
 def print_header():
     print("\n" + "=" * 70)
-    print("  SCANNER v10.1 - Small/Micro Cap | $%.0f-$%.0f | Liq min: $%.0fM/dia" % (
+    print("  SCANNER v10.2 - Small/Micro Cap | $%.0f-$%.0f | Liq min: $%.0fM/dia" % (
         MIN_PRICE, MAX_PRICE, MIN_DOLLAR_VOL / 1e6))
     print("  %s | Universo: screener Yahoo (mcap $50M-$2B)" % datetime.now().strftime("%d/%m/%Y %H:%M"))
     print("=" * 70 + "\n")
@@ -599,16 +672,33 @@ def print_table(signals):
 # --------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Trading Scanner v10")
+    parser = argparse.ArgumentParser(description="Trading Scanner v10.2")
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--table", action="store_true")
     parser.add_argument("--max-tickers", type=int, default=MAX_TICKERS)
+    parser.add_argument("--mode", choices=["auto", "preclose", "postclose"],
+                        default="auto",
+                        help="auto: decide pela hora de NY (pre-fecho "
+                             "15:10-15:59 ET; pos-fecho apos 16:05 ET)")
     args = parser.parse_args()
 
+    mode = resolve_mode(None if args.mode == "auto" else args.mode)
+    if mode is None:
+        print("Sessao de NY a decorrer fora da janela pre-fecho "
+              "(15:10-15:59 ET). A abortar: um sinal calculado a meio da "
+              "sessao fica obsoleto ate ao fecho. Use --mode postclose "
+              "para forcar com os dados do fecho anterior.")
+        return
+    session_frac = ny_session_fraction() if mode == "preclose" else 1.0
+    mode_label = ("PRE-FECHO ~%s ET (barra provisoria)" %
+                  ny_now().strftime("%H:%M")) if mode == "preclose" \
+                 else "POS-FECHO (dados finais)"
+
     telegram_mode = bool(os.environ.get("TELEGRAM_TOKEN"))
-    today = datetime.now(timezone.utc).date()
+    today = ny_now().date()   # data da sessao = data de NY, nao UTC
 
     print_header()
+    print('  MODO: %s\n' % mode_label)
     print("  A obter universo de tickers...\n")
     tickers = get_universe(args.max_tickers)
 
@@ -624,7 +714,7 @@ def main():
     for i, (ticker, df) in enumerate(sorted(data.items()), 1):
         print("\r  Analise: %d/%d - %-8s | Sinais: %d" % (
             i, n_data, ticker, len(signals)), end="", flush=True)
-        result = analyse_ticker(ticker, df, today)
+        result = analyse_ticker(ticker, df, today, mode, session_frac)
         if result:
             signals.append(result)
     print("\r" + " " * 65 + "\r", end="")
@@ -632,7 +722,7 @@ def main():
     if not signals:
         print("  Nenhum sinal encontrado hoje.")
         if telegram_mode:
-            send_telegram("*SMALL CAP SCANNER v10.1 - %s*\n\n_%d analisadas (%d com dados)._\n"
+            send_telegram("*SMALL CAP SCANNER v10.2 - %s*\n\n_%d analisadas (%d com dados)._\n"
                           "Nenhum sinal encontrado hoje." % (
                               datetime.now().strftime("%d/%m/%Y"), len(tickers), n_data))
         return
@@ -655,7 +745,7 @@ def main():
     print("  Nao constitui aconselhamento financeiro.\n")
 
     if telegram_mode:
-        send_telegram(format_for_telegram(top_signals, len(tickers), n_data))
+        send_telegram(format_for_telegram(top_signals, len(tickers), n_data, mode_label))
         print("  Mensagem enviada ao Telegram!\n")
 
 if __name__ == "__main__":
