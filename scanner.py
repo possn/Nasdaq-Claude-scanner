@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Trading Scanner v10.2 - Small/Micro Cap
+# Trading Scanner v10.3 - Small/Micro Cap
 #
 # ALTERACOES v10.2 (modos de execucao):
+# ALTERACOES v10.3:
+#  - CORRECCAO: pedir --mode preclose fora da janela 15:10-15:59 ET passa
+#    a abortar (na v10.2, o cron pre-fecho da estacao DST errada caia
+#    16:20 ET, o modo auto resolvia para pos-fecho e duplicava a mensagem
+#    diaria). O workflow agora declara a intencao de cada cron.
+#  - Workflow: actions actualizadas para Node 24 (checkout@v6,
+#    setup-python@v6) - resolve o aviso de deprecacao do Node 20.
+#
 #  - Modo PRE-FECHO: corre na janela 15:10-15:59 ET com a barra parcial
 #    do dia (volume pro-rateado pela fraccao da sessao, estimativa
 #    conservadora) para permitir entrada nos minutos finais a preco ~=
@@ -375,19 +383,22 @@ def ny_session_fraction(now=None):
 
 def resolve_mode(requested, now=None):
     """Determina o modo de execucao pela hora de Nova Iorque.
-    'preclose': 15:10-15:59 ET em dia util - usa a barra parcial de hoje,
-                para entrada nos minutos finais da sessao.
-    'postclose': apos o fecho (ou fim de semana/madrugada) - dados finais,
-                para entrada no dia seguinte.
-    None: sessao a decorrer fora da janela pre-fecho - abortar (um sinal
-          calculado a meio da sessao fica obsoleto ate ao fecho). O cron
-          pre-fecho da estacao DST errada cai aqui e termina sozinho."""
+    'preclose': SO valido na janela 15:10-15:59 ET em dia util (mesmo
+                quando pedido explicitamente - fora da janela aborta;
+                e o que faz o cron pre-fecho da estacao DST errada
+                terminar sem correr, em vez de duplicar o pos-fecho).
+    'postclose': pode ser forcado a qualquer hora; em auto, resolve-se
+                apos o fecho, de madrugada ou ao fim de semana.
+    None: abortar."""
     now = now or ny_now()
-    if requested in ("preclose", "postclose"):
-        return requested
     t = now.hour * 60 + now.minute
     weekday = now.weekday() < 5
-    if weekday and (15 * 60 + 10) <= t < (16 * 60):
+    in_preclose = weekday and (15 * 60 + 10) <= t < (16 * 60)
+    if requested == "postclose":
+        return "postclose"
+    if requested == "preclose":
+        return "preclose" if in_preclose else None
+    if in_preclose:
         return "preclose"
     if (not weekday) or t >= (16 * 60 + 5) or t < (9 * 60 + 30):
         return "postclose"
@@ -616,7 +627,7 @@ def send_telegram(message):
 
 def format_for_telegram(signals, n_scanned, n_data, mode_label=""):
     date_str = datetime.now().strftime("%d/%m/%Y")
-    lines = ["*SMALL/MICRO CAP - SINAIS DO DIA (v10.2)*",
+    lines = ["*SMALL/MICRO CAP - SINAIS DO DIA (v10.3)*",
              "_%s | %s_" % (date_str, mode_label),
              "_%d analisadas (%d com dados validos)_" % (n_scanned, n_data),
              ""]
@@ -642,7 +653,7 @@ def format_for_telegram(signals, n_scanned, n_data, mode_label=""):
 
 def print_header():
     print("\n" + "=" * 70)
-    print("  SCANNER v10.2 - Small/Micro Cap | $%.0f-$%.0f | Liq min: $%.0fM/dia" % (
+    print("  SCANNER v10.3 - Small/Micro Cap | $%.0f-$%.0f | Liq min: $%.0fM/dia" % (
         MIN_PRICE, MAX_PRICE, MIN_DOLLAR_VOL / 1e6))
     print("  %s | Universo: screener Yahoo (mcap $50M-$2B)" % datetime.now().strftime("%d/%m/%Y %H:%M"))
     print("=" * 70 + "\n")
@@ -672,7 +683,7 @@ def print_table(signals):
 # --------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Trading Scanner v10.2")
+    parser = argparse.ArgumentParser(description="Trading Scanner v10.3")
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--table", action="store_true")
     parser.add_argument("--max-tickers", type=int, default=MAX_TICKERS)
@@ -684,10 +695,10 @@ def main():
 
     mode = resolve_mode(None if args.mode == "auto" else args.mode)
     if mode is None:
-        print("Sessao de NY a decorrer fora da janela pre-fecho "
-              "(15:10-15:59 ET). A abortar: um sinal calculado a meio da "
-              "sessao fica obsoleto ate ao fecho. Use --mode postclose "
-              "para forcar com os dados do fecho anterior.")
+        print("Fora da janela valida para o modo pedido (pre-fecho = "
+              "15:10-15:59 ET, dia util). A abortar sem enviar nada. "
+              "Use --mode postclose para forcar com dados do fecho "
+              "anterior.")
         return
     session_frac = ny_session_fraction() if mode == "preclose" else 1.0
     mode_label = ("PRE-FECHO ~%s ET (barra provisoria)" %
@@ -722,7 +733,7 @@ def main():
     if not signals:
         print("  Nenhum sinal encontrado hoje.")
         if telegram_mode:
-            send_telegram("*SMALL CAP SCANNER v10.2 - %s*\n\n_%d analisadas (%d com dados)._\n"
+            send_telegram("*SMALL CAP SCANNER v10.3 - %s*\n\n_%d analisadas (%d com dados)._\n"
                           "Nenhum sinal encontrado hoje." % (
                               datetime.now().strftime("%d/%m/%Y"), len(tickers), n_data))
         return
